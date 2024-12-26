@@ -17,4 +17,3 @@ vendor/
 
 # Environment variables
 .env.development
-.env.production

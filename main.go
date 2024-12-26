@@ -26,16 +26,17 @@ func init() {
 	}
 
 	// Try to load environment-specific .env file first
-	envFile := fmt.Sprintf(".env.%s", env)
-	err := godotenv.Load(envFile)
-	if err != nil {
-		log.Printf("Warning: Error loading %s: %v", envFile, err)
-		// Try to load default .env as fallback
-		if err := godotenv.Load(); err != nil {
-			log.Printf("Warning: Error loading .env: %v", err)
+	if env == "development" {
+		envFile := fmt.Sprintf(".env.%s", env)
+		err := godotenv.Load(envFile)
+		if err != nil {
+			log.Printf("Warning: Error loading %s: %v", envFile, err)
+			if err := godotenv.Load(); err != nil {
+				log.Printf("Warning: Error loading .env: %v", err)
+			}
+		} else {
+			log.Printf("Loaded configuration from %s", envFile)
 		}
-	} else {
-		log.Printf("Loaded configuration from %s", envFile)
 	}
 }
 
