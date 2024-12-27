@@ -133,23 +133,41 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.clients.Store(clientID, conn)
 
-	// Get initial count
-	count, err := s.redisClient.Get(ctx, "counter").Int64()
-	if err == redis.Nil {
-		count = 0
-		if err := s.redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
-			log.Printf("Error initializing counter: %v", err)
+	// Get initial count with retry
+	var count int64
+	var getErr error
+	for i := 0; i < 3; i++ {
+		log.Printf("Attempting to get initial count (attempt %d)", i+1)
+		count, getErr = s.redisClient.Get(ctx, "counter").Int64()
+		if getErr == redis.Nil {
+			log.Printf("Counter not found, initializing to 0")
+			count = 0
+			if err := s.redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
+				log.Printf("Error initializing counter: %v", err)
+			}
+			break
+		} else if getErr != nil {
+			log.Printf("Redis get error (attempt %d): %v", i+1, getErr)
+			time.Sleep(time.Second)
+			continue
 		}
-	} else if err != nil {
-		log.Printf("Redis error: %v", err)
+		log.Printf("Successfully got initial count: %d", count)
+		break
+	}
+
+	if getErr != nil && getErr != redis.Nil {
+		log.Printf("Failed to get initial count after retries: %v", getErr)
 		return
 	}
 
 	// Send initial count
-	if err := conn.WriteJSON(Message{Type: "count", Count: count}); err != nil {
-		log.Printf("Error sending initial count: %v", err)
+	initialMsg := Message{Type: "count", Count: count}
+	log.Printf("Sending initial count to client %s: %d", clientID, count)
+	if err := conn.WriteJSON(initialMsg); err != nil {
+		log.Printf("Error sending initial count to client %s: %v", clientID, err)
 		return
 	}
+	log.Printf("Successfully sent initial count to client %s", clientID)
 
 	// Subscribe to Redis updates
 	pubsub := s.redisClient.Subscribe(ctx, "counter-channel")
@@ -158,18 +176,22 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Handle Redis messages
 	go func() {
 		defer pubsub.Close()
+		log.Printf("Started Redis message handler for client %s", clientID)
 		for {
 			select {
 			case <-done:
+				log.Printf("Redis message handler stopping for client %s", clientID)
 				return
 			case msg := <-pubsub.Channel():
 				var data struct {
 					Count int64 `json:"count"`
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
+					log.Printf("Error unmarshaling message for client %s: %v", clientID, err)
 					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
+				log.Printf("Received Redis update for client %s: %d", clientID, data.Count)
 				messages <- Message{Type: "count", Count: data.Count}
 			}
 		}
@@ -177,20 +199,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Handle incoming WebSocket messages
 	go func() {
+		log.Printf("Started WebSocket message handler for client %s", clientID)
 		for {
 			select {
 			case <-done:
+				log.Printf("WebSocket message handler stopping for client %s", clientID)
 				return
 			default:
 				var msg Message
 				if err := conn.ReadJSON(&msg); err != nil {
 					if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+						log.Printf("WebSocket read error for client %s: %v", clientID, err)
 						errors <- fmt.Errorf("read error: %v", err)
 					}
 					return
 				}
 
 				if msg.Type == "increment" {
+					log.Printf("Received increment request from client %s", clientID)
 					messages <- msg
 				}
 			}
@@ -201,6 +227,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-done:
+			log.Printf("Main event loop stopping for client %s", clientID)
 			return
 		case err := <-errors:
 			log.Printf("Client %s error: %v", clientID, err)
@@ -208,6 +235,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case msg := <-messages:
 			switch msg.Type {
 			case "count":
+				log.Printf("Sending count update to client %s: %d", clientID, msg.Count)
 				if err := conn.WriteJSON(msg); err != nil {
 					log.Printf("Error sending count to client %s: %v", clientID, err)
 					return
@@ -215,9 +243,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "increment":
 				newCount, err := s.redisClient.Incr(ctx, "counter").Result()
 				if err != nil {
-					log.Printf("Redis increment error: %v", err)
+					log.Printf("Redis increment error for client %s: %v", clientID, err)
 					continue
 				}
+				log.Printf("Incremented counter for client %s to %d", clientID, newCount)
 
 				data := struct {
 					Count int64 `json:"count"`
@@ -225,12 +254,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				countBytes, err := json.Marshal(data)
 				if err != nil {
-					log.Printf("Error marshaling count: %v", err)
+					log.Printf("Error marshaling count for client %s: %v", clientID, err)
 					continue
 				}
 
 				if err := s.redisClient.Publish(ctx, "counter-channel", string(countBytes)).Err(); err != nil {
-					log.Printf("Error publishing count: %v", err)
+					log.Printf("Error publishing count for client %s: %v", clientID, err)
 				}
 			}
 		}
