@@ -153,17 +153,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		count = 0
 		if err := s.redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
 			errorLog("Error initializing counter: %v", err)
+			return
 		}
+		debugLog("Initialized counter to 0")
 	} else if err != nil {
 		errorLog("Redis error: %v", err)
 		return
 	}
+	debugLog("Got initial count: %d", count)
 
+	// Send initial count with write deadline
+	conn.SetWriteDeadline(time.Now().Add(writeWait))
 	initialMsg := Message{Type: "count", Count: count}
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		errorLog("Error sending initial count: %v", err)
 		return
 	}
+	debugLog("Sent initial count: %d", count)
 
 	pubsub := s.redisClient.Subscribe(ctx, "counter-channel")
 	defer pubsub.Close()
