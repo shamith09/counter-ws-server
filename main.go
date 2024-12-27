@@ -162,7 +162,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial count
 	initialMsg := Message{Type: "count", Count: count}
-	log.Printf("Sending initial count to client %s: %d", clientID, count)
+	log.Printf("Sending initial count to client %s: %d (raw message: %+v)", clientID, count, initialMsg)
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		log.Printf("Error sending initial count to client %s: %v", clientID, err)
 		return
@@ -186,13 +186,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				var data struct {
 					Count int64 `json:"count"`
 				}
+				log.Printf("Received Redis message: %s", msg.Payload)
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
 					log.Printf("Error unmarshaling message for client %s: %v", clientID, err)
 					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
 				log.Printf("Received Redis update for client %s: %d", clientID, data.Count)
-				messages <- Message{Type: "count", Count: data.Count}
+				outMsg := Message{Type: "count", Count: data.Count}
+				log.Printf("Sending message to client %s: %+v", clientID, outMsg)
+				messages <- outMsg
 			}
 		}
 	}()
@@ -235,7 +238,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case msg := <-messages:
 			switch msg.Type {
 			case "count":
-				log.Printf("Sending count update to client %s: %d", clientID, msg.Count)
+				log.Printf("Sending count update to client %s: %+v", clientID, msg)
 				if err := conn.WriteJSON(msg); err != nil {
 					log.Printf("Error sending count to client %s: %v", clientID, err)
 					return
@@ -258,6 +261,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
+				log.Printf("Publishing count update: %s", string(countBytes))
 				if err := s.redisClient.Publish(ctx, "counter-channel", string(countBytes)).Err(); err != nil {
 					log.Printf("Error publishing count for client %s: %v", clientID, err)
 				}
