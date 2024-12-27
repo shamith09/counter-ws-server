@@ -62,6 +62,17 @@ type Message struct {
 	Count int64  `json:"count"`
 }
 
+const (
+	// Time allowed to write a message to the peer
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period (must be less than pongWait)
+	pingPeriod = (pongWait * 9) / 10
+)
+
 func NewServer() *Server {
 	redisHost := os.Getenv("REDIS_HOST")
 	redisPort := os.Getenv("REDIS_PORT")
@@ -110,6 +121,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Configure WebSocket connection
+	conn.SetReadLimit(512)
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	clientID := uuid.New().String()
 	debugLog("New client connected: %s", clientID)
 
@@ -149,12 +168,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	pubsub := s.redisClient.Subscribe(ctx, "counter-channel")
 	defer pubsub.Close()
 
+	// Start ping ticker
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
+	// Handle Redis messages and pings
 	go func() {
 		defer pubsub.Close()
 		for {
 			select {
 			case <-done:
 				return
+			case <-ticker.C:
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					errors <- fmt.Errorf("ping error: %v", err)
+					return
+				}
 			case msg := <-pubsub.Channel():
 				var data struct {
 					Count int64 `json:"count"`
@@ -169,6 +199,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Handle incoming WebSocket messages
 	go func() {
 		for {
 			select {
@@ -184,8 +215,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				if msg.Type == "increment" {
+				switch msg.Type {
+				case "increment":
 					messages <- msg
+				case "ping":
+					// Respond to client ping with a pong message
+					if err := conn.WriteJSON(Message{Type: "pong"}); err != nil {
+						errorLog("Error sending pong: %v", err)
+					}
 				}
 			}
 		}
