@@ -132,18 +132,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := uuid.New().String()
 	debugLog("New client connected: %s", clientID)
 
-	messages := make(chan Message)
-	errors := make(chan error)
+	messages := make(chan Message, 100) // Buffered channel to prevent blocking
+	errors := make(chan error, 10)      // Buffered channel for errors
 	done := make(chan struct{})
 
-	defer func() {
-		close(done)
-		close(messages)
+	var wg sync.WaitGroup
+	cleanup := func() {
+		close(done)     // Signal all goroutines to stop
+		conn.Close()    // Close the connection
+		wg.Wait()       // Wait for all goroutines to finish
+		close(messages) // Now safe to close channels
 		close(errors)
-		conn.Close()
 		s.clients.Delete(clientID)
 		debugLog("Client disconnected: %s", clientID)
-	}()
+	}
+	defer cleanup()
 
 	s.clients.Store(clientID, conn)
 
@@ -179,8 +182,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 
 	// Handle Redis messages and pings
+	wg.Add(1)
 	go func() {
-		defer pubsub.Close()
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
@@ -188,7 +192,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case <-ticker.C:
 				conn.SetWriteDeadline(time.Now().Add(writeWait))
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					errors <- fmt.Errorf("ping error: %v", err)
+					select {
+					case errors <- fmt.Errorf("ping error: %v", err):
+					case <-done:
+					}
 					return
 				}
 			case msg := <-pubsub.Channel():
@@ -197,16 +204,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
 					errorLog("Error unmarshaling message: %v", err)
-					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
-				messages <- Message{Type: "count", Count: data.Count}
+				select {
+				case messages <- Message{Type: "count", Count: data.Count}:
+				case <-done:
+					return
+				default:
+					errorLog("Message channel full, dropping message")
+				}
 			}
 		}
 	}()
 
 	// Handle incoming WebSocket messages
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
@@ -216,16 +230,25 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if err := conn.ReadJSON(&msg); err != nil {
 					if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 						errorLog("WebSocket read error: %v", err)
-						errors <- fmt.Errorf("read error: %v", err)
+						select {
+						case errors <- fmt.Errorf("read error: %v", err):
+						case <-done:
+						}
 					}
 					return
 				}
 
 				switch msg.Type {
 				case "increment":
-					messages <- msg
+					select {
+					case messages <- msg:
+					case <-done:
+						return
+					default:
+						errorLog("Message channel full, dropping increment")
+					}
 				case "ping":
-					// Respond to client ping with a pong message
+					conn.SetWriteDeadline(time.Now().Add(writeWait))
 					if err := conn.WriteJSON(Message{Type: "pong"}); err != nil {
 						errorLog("Error sending pong: %v", err)
 					}
@@ -234,6 +257,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Main event loop
 	for {
 		select {
 		case <-done:
@@ -242,6 +266,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			errorLog("Client error: %v", err)
 			return
 		case msg := <-messages:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
 			switch msg.Type {
 			case "count":
 				if err := conn.WriteJSON(msg); err != nil {
