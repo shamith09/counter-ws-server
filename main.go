@@ -53,23 +53,25 @@ type Message struct {
 
 func NewServer() *Server {
 	// Log environment variables (without password)
-	log.Printf("Connecting to Redis at %s:%s with username: %s",
-		os.Getenv("REDIS_HOST"),
-		os.Getenv("REDIS_PORT"),
-		os.Getenv("REDIS_USERNAME"))
+	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+	redisUsername := os.Getenv("REDIS_USERNAME")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
+	log.Printf("Connecting to Redis at %s:%s with username: %s", redisHost, redisPort, redisUsername)
 
 	// Initialize Redis client with proper address formatting
-	redisAddr := fmt.Sprintf("%s:%s", os.Getenv("REDIS_HOST"), os.Getenv("REDIS_PORT"))
+	redisAddr := fmt.Sprintf("%s:%s", redisHost, redisPort)
 	opts := &redis.Options{
 		Addr:     redisAddr,
-		Username: os.Getenv("REDIS_USERNAME"),
-		Password: os.Getenv("REDIS_PASSWORD"),
+		Username: redisUsername,
+		Password: redisPassword,
 		DB:       0,
 	}
 
 	redisClient := redis.NewClient(opts)
 
-	// Test Redis connection with timeout
+	// Test Redis connection with timeout and initialize counter
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -77,9 +79,32 @@ func NewServer() *Server {
 	_, err := redisClient.Ping(ctx).Result()
 	if err != nil {
 		log.Printf("Warning: Redis connection failed: %v", err)
-		log.Printf("Redis connection details: %+v", opts)
+		log.Printf("Redis connection details (without password): %+v", &redis.Options{
+			Addr:     opts.Addr,
+			Username: opts.Username,
+			DB:       opts.DB,
+		})
 	} else {
 		log.Printf("Successfully connected to Redis at %s", redisAddr)
+
+		// Initialize counter if it doesn't exist
+		exists, err := redisClient.Exists(ctx, "counter").Result()
+		if err != nil {
+			log.Printf("Error checking counter existence: %v", err)
+		} else if exists == 0 {
+			if err := redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
+				log.Printf("Error initializing counter: %v", err)
+			} else {
+				log.Printf("Counter initialized to 0")
+			}
+		} else {
+			count, err := redisClient.Get(ctx, "counter").Int64()
+			if err != nil {
+				log.Printf("Error getting counter value: %v", err)
+			} else {
+				log.Printf("Current counter value: %d", count)
+			}
+		}
 	}
 
 	// Configure WebSocket upgrader
@@ -144,7 +169,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			count = 0
 			if err := s.redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
 				log.Printf("Error initializing counter: %v", err)
+				continue
 			}
+			// Verify the value was set
+			count, err = s.redisClient.Get(ctx, "counter").Int64()
+			if err != nil {
+				log.Printf("Error verifying counter initialization: %v", err)
+				continue
+			}
+			log.Printf("Counter initialized and verified: %d", count)
 			break
 		} else if getErr != nil {
 			log.Printf("Redis get error (attempt %d): %v", i+1, getErr)
@@ -162,7 +195,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial count
 	initialMsg := Message{Type: "count", Count: count}
-	log.Printf("Sending initial count to client %s: %d (raw message: %+v)", clientID, count, initialMsg)
+	msgBytes, err := json.Marshal(initialMsg)
+	if err != nil {
+		log.Printf("Error marshaling initial message: %v", err)
+		return
+	}
+	log.Printf("Sending initial count to client %s: %d (raw message: %s)", clientID, count, string(msgBytes))
+
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		log.Printf("Error sending initial count to client %s: %v", clientID, err)
 		return
@@ -251,6 +290,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("Incremented counter for client %s to %d", clientID, newCount)
 
+				// Verify the increment
+				verifyCount, err := s.redisClient.Get(ctx, "counter").Int64()
+				if err != nil {
+					log.Printf("Error verifying increment for client %s: %v", clientID, err)
+					continue
+				}
+				if verifyCount != newCount {
+					log.Printf("Warning: Increment verification failed. Expected %d, got %d", newCount, verifyCount)
+					newCount = verifyCount
+				}
+
 				data := struct {
 					Count int64 `json:"count"`
 				}{Count: newCount}
@@ -264,6 +314,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Publishing count update: %s", string(countBytes))
 				if err := s.redisClient.Publish(ctx, "counter-channel", string(countBytes)).Err(); err != nil {
 					log.Printf("Error publishing count for client %s: %v", clientID, err)
+					continue
+				}
+
+				// Send direct update to the client that requested the increment
+				updateMsg := Message{Type: "count", Count: newCount}
+				if err := conn.WriteJSON(updateMsg); err != nil {
+					log.Printf("Error sending increment confirmation to client %s: %v", clientID, err)
+					continue
 				}
 			}
 		}
