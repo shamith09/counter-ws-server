@@ -17,11 +17,13 @@ import (
 )
 
 var ctx = context.Background()
+var isProduction = os.Getenv("GO_ENV") == "production"
 
 // debugLog only logs in development
 func debugLog(format string, v ...interface{}) {
-	// Always log during startup
-	log.Printf(format, v...)
+	if !isProduction {
+		log.Printf(format, v...)
+	}
 }
 
 // errorLog always logs errors
@@ -34,28 +36,19 @@ func init() {
 	if env == "" {
 		env = "development"
 	}
-	log.Printf("Starting server in %s mode", env)
 
-	// Try to load environment-specific file first
-	envFile := fmt.Sprintf(".env.%s", env)
-	err := godotenv.Load(envFile)
-	if err != nil {
-		log.Printf("Error loading %s: %v", envFile, err)
-		// Fallback to .env file
-		if err := godotenv.Load(); err != nil {
-			log.Printf("Error loading .env: %v", err)
+	if env == "development" {
+		envFile := fmt.Sprintf(".env.%s", env)
+		err := godotenv.Load(envFile)
+		if err != nil {
+			errorLog("Error loading %s: %v", envFile, err)
+			if err := godotenv.Load(); err != nil {
+				errorLog("Error loading .env: %v", err)
+			}
 		} else {
-			log.Printf("Loaded configuration from .env")
+			debugLog("Loaded configuration from %s", envFile)
 		}
-	} else {
-		log.Printf("Loaded configuration from %s", envFile)
 	}
-
-	// Log all environment variables we care about
-	log.Printf("Environment variables:")
-	log.Printf("REDIS_HOST: %s", os.Getenv("REDIS_HOST"))
-	log.Printf("REDIS_PORT: %s", os.Getenv("REDIS_PORT"))
-	log.Printf("PORT: %s", os.Getenv("PORT"))
 }
 
 type Server struct {
