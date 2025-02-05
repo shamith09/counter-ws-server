@@ -58,8 +58,9 @@ type Server struct {
 }
 
 type Message struct {
-	Type  string `json:"type"`
-	Count int64  `json:"count"`
+	Type        string `json:"type"`
+	Count       int64  `json:"count"`
+	ViewerCount int64  `json:"viewer_count,omitempty"`
 }
 
 const (
@@ -67,10 +68,14 @@ const (
 	writeWait = 10 * time.Second
 
 	// Time allowed to read the next pong message from the peer
-	pongWait = 60 * time.Second
+	pongWait = 20 * time.Second
 
 	// Send pings to peer with this period (must be less than pongWait)
-	pingPeriod = (pongWait * 9) / 10
+	pingPeriod = 10 * time.Second
+
+	// Counter history keys
+	counterHistoryKey = "counter_history" // Sorted set for counter history
+	historyInterval   = 5 * time.Minute   // Log counter every 5 minutes
 )
 
 func NewServer() *Server {
@@ -109,6 +114,25 @@ func NewServer() *Server {
 	}
 }
 
+// broadcastViewerCount sends the current viewer count to all connected clients
+func (s *Server) broadcastViewerCount() {
+	var count int64
+	s.clients.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+
+	s.clients.Range(func(_, value interface{}) bool {
+		if conn, ok := value.(*websocket.Conn); ok {
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteJSON(Message{Type: "viewer_count", ViewerCount: count}); err != nil {
+				errorLog("Error sending viewer count: %v", err)
+			}
+		}
+		return true
+	})
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		w.WriteHeader(http.StatusOK)
@@ -132,23 +156,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := uuid.New().String()
 	debugLog("New client connected: %s", clientID)
 
-	messages := make(chan Message, 100) // Buffered channel to prevent blocking
-	errors := make(chan error, 10)      // Buffered channel for errors
+	messages := make(chan Message, 100)
+	errors := make(chan error, 10)
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
 	cleanup := func() {
-		close(done)     // Signal all goroutines to stop
-		conn.Close()    // Close the connection
-		wg.Wait()       // Wait for all goroutines to finish
-		close(messages) // Now safe to close channels
+		close(done)
+		conn.Close()
+		wg.Wait()
+		close(messages)
 		close(errors)
 		s.clients.Delete(clientID)
 		debugLog("Client disconnected: %s", clientID)
+		// Broadcast updated viewer count after client disconnects
+		s.broadcastViewerCount()
 	}
 	defer cleanup()
 
 	s.clients.Store(clientID, conn)
+	// Broadcast updated viewer count after new client connects
+	s.broadcastViewerCount()
 
 	// Get initial count
 	count, err := s.redisClient.Get(ctx, "counter").Int64()
@@ -165,14 +193,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	debugLog("Got initial count: %d", count)
 
-	// Send initial count with write deadline
+	// Send initial count
 	conn.SetWriteDeadline(time.Now().Add(writeWait))
 	initialMsg := Message{Type: "count", Count: count}
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		errorLog("Error sending initial count: %v", err)
 		return
 	}
-	debugLog("Sent initial count: %d", count)
+
+	// Send initial viewer count
+	var viewerCount int64
+	s.clients.Range(func(_, _ interface{}) bool {
+		viewerCount++
+		return true
+	})
+	if err := conn.WriteJSON(Message{Type: "viewer_count", ViewerCount: viewerCount}); err != nil {
+		errorLog("Error sending initial viewer count: %v", err)
+		return
+	}
 
 	pubsub := s.redisClient.Subscribe(ctx, "counter-channel")
 	defer pubsub.Close()
@@ -204,6 +242,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
 					errorLog("Error unmarshaling message: %v", err)
+					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
 				select {
@@ -296,6 +335,41 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func (s *Server) startHistoryLogger(ctx context.Context) {
+	ticker := time.NewTicker(historyInterval)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				count, err := s.redisClient.Get(ctx, "counter").Int64()
+				if err != nil && err != redis.Nil {
+					errorLog("Error getting counter for history: %v", err)
+					continue
+				}
+
+				// Store as a sorted set with timestamp as score
+				now := float64(time.Now().Unix())
+				member := fmt.Sprintf("%d:%d", time.Now().Unix(), count)
+				if err := s.redisClient.ZAdd(ctx, counterHistoryKey, &redis.Z{
+					Score:  now,
+					Member: member,
+				}).Err(); err != nil {
+					errorLog("Error storing counter history: %v", err)
+				}
+
+				// Cleanup old entries (keep last 30 days)
+				cutoff := float64(time.Now().Add(-30 * 24 * time.Hour).Unix())
+				if err := s.redisClient.ZRemRangeByScore(ctx, counterHistoryKey, "-inf", fmt.Sprintf("%f", cutoff)).Err(); err != nil {
+					errorLog("Error cleaning up counter history: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 func main() {
