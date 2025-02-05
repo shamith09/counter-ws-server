@@ -76,12 +76,17 @@ const (
 	// Counter history keys
 	counterHistoryKey = "counter_history" // Sorted set for counter history
 	historyInterval   = 5 * time.Minute   // Log counter every 5 minutes
+
+	// Viewer count key
+	viewerSetKey = "viewer_set" // Set of active viewer IDs
 )
 
 func NewServer() *Server {
 	redisHost := os.Getenv("REDIS_HOST")
 	redisPort := os.Getenv("REDIS_PORT")
 	redisAddr := fmt.Sprintf("%s:%s", redisHost, redisPort)
+
+	debugLog("Redis connection details - Host: %s, Port: %s, Addr: %s", redisHost, redisPort, redisAddr)
 
 	opts := &redis.Options{
 		Addr:     redisAddr,
@@ -116,11 +121,11 @@ func NewServer() *Server {
 
 // broadcastViewerCount sends the current viewer count to all connected clients
 func (s *Server) broadcastViewerCount() {
-	var count int64
-	s.clients.Range(func(_, _ interface{}) bool {
-		count++
-		return true
-	})
+	count, err := s.redisClient.SCard(ctx, viewerSetKey).Result()
+	if err != nil {
+		errorLog("Error getting viewer count: %v", err)
+		return
+	}
 
 	s.clients.Range(func(_, value interface{}) bool {
 		if conn, ok := value.(*websocket.Conn); ok {
@@ -168,6 +173,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		close(messages)
 		close(errors)
 		s.clients.Delete(clientID)
+		// Remove client from Redis set
+		if err := s.redisClient.SRem(ctx, viewerSetKey, clientID).Err(); err != nil {
+			errorLog("Error removing client from Redis set: %v", err)
+		}
 		debugLog("Client disconnected: %s", clientID)
 		// Broadcast updated viewer count after client disconnects
 		s.broadcastViewerCount()
@@ -175,6 +184,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer cleanup()
 
 	s.clients.Store(clientID, conn)
+	// Add client to Redis set
+	if err := s.redisClient.SAdd(ctx, viewerSetKey, clientID).Err(); err != nil {
+		errorLog("Error adding client to Redis set: %v", err)
+		return
+	}
 	// Broadcast updated viewer count after new client connects
 	s.broadcastViewerCount()
 
