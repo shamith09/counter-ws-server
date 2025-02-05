@@ -86,6 +86,11 @@ func NewServer() *Server {
 	redisPort := os.Getenv("REDIS_PORT")
 	redisAddr := fmt.Sprintf("%s:%s", redisHost, redisPort)
 
+	log.Printf("Connecting to Redis at %s", redisAddr)
+	if redisHost == "" || redisPort == "" {
+		log.Printf("WARNING: Redis host or port is empty - Host: '%s', Port: '%s'", redisHost, redisPort)
+	}
+
 	opts := &redis.Options{
 		Addr:     redisAddr,
 		Username: os.Getenv("REDIS_USERNAME"),
@@ -100,6 +105,16 @@ func NewServer() *Server {
 
 	if _, err := redisClient.Ping(ctx).Result(); err != nil {
 		errorLog("Redis connection failed: %v", err)
+		// Try to connect to default Redis address as fallback
+		opts.Addr = "127.0.0.1:6379"
+		redisClient = redis.NewClient(opts)
+		if _, err := redisClient.Ping(ctx).Result(); err != nil {
+			errorLog("Fallback Redis connection also failed: %v", err)
+		} else {
+			log.Printf("Connected to Redis using fallback address: %s", opts.Addr)
+		}
+	} else {
+		log.Printf("Successfully connected to Redis at %s", redisAddr)
 	}
 
 	upgrader := websocket.Upgrader{
