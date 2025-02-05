@@ -17,13 +17,12 @@ import (
 )
 
 var ctx = context.Background()
-var isProduction = os.Getenv("GO_ENV") == "production"
+var isProduction = false
 
 // debugLog only logs in development
 func debugLog(format string, v ...interface{}) {
-	if !isProduction {
-		log.Printf(format, v...)
-	}
+	// Always log during startup
+	log.Printf(format, v...)
 }
 
 // errorLog always logs errors
@@ -36,19 +35,25 @@ func init() {
 	if env == "" {
 		env = "development"
 	}
+	log.Printf("Starting server in %s mode", env)
 
-	if env == "development" {
-		envFile := fmt.Sprintf(".env.%s", env)
-		err := godotenv.Load(envFile)
-		if err != nil {
-			errorLog("Error loading %s: %v", envFile, err)
-			if err := godotenv.Load(); err != nil {
-				errorLog("Error loading .env: %v", err)
-			}
+	// Try to load environment-specific file first
+	envFile := fmt.Sprintf(".env.%s", env)
+	err := godotenv.Load(envFile)
+	if err != nil {
+		log.Printf("Error loading %s: %v", envFile, err)
+		// Fallback to .env file
+		if err := godotenv.Load(); err != nil {
+			log.Printf("Error loading .env: %v", err)
 		} else {
-			debugLog("Loaded configuration from %s", envFile)
+			log.Printf("Loaded configuration from .env")
 		}
+	} else {
+		log.Printf("Loaded configuration from %s", envFile)
 	}
+
+	// Set production mode after loading env files
+	isProduction = os.Getenv("GO_ENV") == "production"
 }
 
 type Server struct {
