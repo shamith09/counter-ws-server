@@ -83,7 +83,8 @@ const (
 	historyInterval   = 5 * time.Minute   // Log counter every 5 minutes
 
 	// Viewer count key
-	viewerSetKey = "viewer_set" // Set of active viewer IDs
+	viewerSetKey  = "viewer_set"     // Set of active viewer IDs
+	viewerTimeout = 30 * time.Second // Time after which a viewer is considered stale
 )
 
 func NewServer() *Server {
@@ -138,7 +139,7 @@ func NewServer() *Server {
 }
 
 // broadcastViewerCount sends the current viewer count to all connected clients
-func (s *Server) broadcastViewerCount() {
+func (s *Server) broadcastViewerCount(ctx context.Context) {
 	count, err := s.redisClient.SCard(ctx, viewerSetKey).Result()
 	if err != nil {
 		errorLog("Error getting viewer count: %v", err)
@@ -197,7 +198,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		debugLog("Client disconnected: %s", clientID)
 		// Broadcast updated viewer count after client disconnects
-		s.broadcastViewerCount()
+		s.broadcastViewerCount(ctx)
 	}
 	defer cleanup()
 
@@ -208,7 +209,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Broadcast updated viewer count after new client connects
-	s.broadcastViewerCount()
+	s.broadcastViewerCount(ctx)
 
 	// Get initial count
 	count, err := s.redisClient.Get(ctx, "counter").Int64()
@@ -404,8 +405,43 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 	}()
 }
 
+func (s *Server) cleanupStaleViewers() {
+	ticker := time.NewTicker(10 * time.Second)
+	go func() {
+		for range ticker.C {
+			viewers, err := s.redisClient.SMembers(context.Background(), viewerSetKey).Result()
+			if err != nil {
+				log.Printf("Error getting viewers: %v", err)
+				continue
+			}
+
+			// Check each viewer ID against the active connections
+			for _, viewerID := range viewers {
+				var found bool
+				s.clients.Range(func(key, _ interface{}) bool {
+					if key == viewerID {
+						found = true
+						return false // stop iteration
+					}
+					return true
+				})
+
+				if !found {
+					// Remove stale viewer
+					s.redisClient.SRem(context.Background(), viewerSetKey, viewerID)
+					log.Printf("Removed stale viewer: %s", viewerID)
+				}
+			}
+			// Broadcast updated count
+			s.broadcastViewerCount(context.Background())
+		}
+	}()
+}
+
 func main() {
 	server := NewServer()
+	// Start the cleanup routine
+	server.cleanupStaleViewers()
 	http.HandleFunc("/ws", server.handleWebSocket)
 
 	port := os.Getenv("PORT")
