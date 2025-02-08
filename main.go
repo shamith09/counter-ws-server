@@ -92,18 +92,27 @@ func NewServer() *Server {
 	}
 
 	opts := &redis.Options{
-		Addr:     redisAddr,
-		Username: os.Getenv("REDIS_USERNAME"),
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:         redisAddr,
+		Username:     os.Getenv("REDIS_USERNAME"),
+		Password:     os.Getenv("REDIS_PASSWORD"),
+		DB:           0,
+		DialTimeout:  10 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
+	log.Printf("Redis connection options: %+v", opts)
 	redisClient := redis.NewClient(opts)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if _, err := redisClient.Ping(ctx).Result(); err != nil {
+		log.Printf("Redis connection details - Host: %s, Port: %s, Username: %s, Password set: %v",
+			redisHost,
+			redisPort,
+			opts.Username,
+			opts.Password != "")
 		log.Fatalf("Failed to connect to Redis at %s: %v", redisAddr, err)
 	}
 	log.Printf("Successfully connected to Redis at %s", redisAddr)
