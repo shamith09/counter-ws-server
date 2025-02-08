@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
@@ -63,9 +62,8 @@ type Server struct {
 }
 
 type Message struct {
-	Type        string `json:"type"`
-	Count       int64  `json:"count"`
-	ViewerCount int64  `json:"viewer_count,omitempty"`
+	Type  string `json:"type"`
+	Count int64  `json:"count"`
 }
 
 const (
@@ -81,10 +79,6 @@ const (
 	// Counter history keys
 	counterHistoryKey = "counter_history" // Sorted set for counter history
 	historyInterval   = 5 * time.Minute   // Log counter every 5 minutes
-
-	// Viewer count key
-	viewerSetKey  = "viewer_set"     // Set of active viewer IDs
-	viewerTimeout = 30 * time.Second // Time after which a viewer is considered stale
 )
 
 func NewServer() *Server {
@@ -138,25 +132,6 @@ func NewServer() *Server {
 	}
 }
 
-// broadcastViewerCount sends the current viewer count to all connected clients
-func (s *Server) broadcastViewerCount(ctx context.Context) {
-	count, err := s.redisClient.SCard(ctx, viewerSetKey).Result()
-	if err != nil {
-		errorLog("Error getting viewer count: %v", err)
-		return
-	}
-
-	s.clients.Range(func(_, value interface{}) bool {
-		if conn, ok := value.(*websocket.Conn); ok {
-			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteJSON(Message{Type: "viewer_count", ViewerCount: count}); err != nil {
-				errorLog("Error sending viewer count: %v", err)
-			}
-		}
-		return true
-	})
-}
-
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		w.WriteHeader(http.StatusOK)
@@ -177,7 +152,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	clientID := uuid.New().String()
+	clientID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
 	debugLog("New client connected: %s", clientID)
 
 	messages := make(chan Message, 100)
@@ -192,24 +167,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		close(messages)
 		close(errors)
 		s.clients.Delete(clientID)
-		// Remove client from Redis set
-		if err := s.redisClient.SRem(ctx, viewerSetKey, clientID).Err(); err != nil {
-			errorLog("Error removing client from Redis set: %v", err)
-		}
 		debugLog("Client disconnected: %s", clientID)
-		// Broadcast updated viewer count after client disconnects
-		s.broadcastViewerCount(ctx)
 	}
 	defer cleanup()
 
 	s.clients.Store(clientID, conn)
-	// Add client to Redis set
-	if err := s.redisClient.SAdd(ctx, viewerSetKey, clientID).Err(); err != nil {
-		errorLog("Error adding client to Redis set: %v", err)
-		return
-	}
-	// Broadcast updated viewer count after new client connects
-	s.broadcastViewerCount(ctx)
 
 	// Get initial count
 	count, err := s.redisClient.Get(ctx, "counter").Int64()
@@ -231,17 +193,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	initialMsg := Message{Type: "count", Count: count}
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		errorLog("Error sending initial count: %v", err)
-		return
-	}
-
-	// Send initial viewer count
-	var viewerCount int64
-	s.clients.Range(func(_, _ interface{}) bool {
-		viewerCount++
-		return true
-	})
-	if err := conn.WriteJSON(Message{Type: "viewer_count", ViewerCount: viewerCount}); err != nil {
-		errorLog("Error sending initial viewer count: %v", err)
 		return
 	}
 
@@ -405,50 +356,15 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 	}()
 }
 
-func (s *Server) cleanupStaleViewers() {
-	ticker := time.NewTicker(10 * time.Second)
-	go func() {
-		for range ticker.C {
-			viewers, err := s.redisClient.SMembers(context.Background(), viewerSetKey).Result()
-			if err != nil {
-				log.Printf("Error getting viewers: %v", err)
-				continue
-			}
-
-			// Check each viewer ID against the active connections
-			for _, viewerID := range viewers {
-				var found bool
-				s.clients.Range(func(key, _ interface{}) bool {
-					if key == viewerID {
-						found = true
-						return false // stop iteration
-					}
-					return true
-				})
-
-				if !found {
-					// Remove stale viewer
-					s.redisClient.SRem(context.Background(), viewerSetKey, viewerID)
-					log.Printf("Removed stale viewer: %s", viewerID)
-				}
-			}
-			// Broadcast updated count
-			s.broadcastViewerCount(context.Background())
-		}
-	}()
-}
-
 func main() {
 	server := NewServer()
-	// Start the cleanup routine
-	server.cleanupStaleViewers()
 	http.HandleFunc("/ws", server.handleWebSocket)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("Server starting on port %s", port)
+	log.Printf("Counter WebSocket server starting on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
