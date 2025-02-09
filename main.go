@@ -18,12 +18,6 @@ import (
 var ctx = context.Background()
 var isProduction = false
 
-// debugLog only logs in development
-func debugLog(format string, v ...interface{}) {
-	// Always log during startup
-	log.Printf(format, v...)
-}
-
 // errorLog always logs errors
 func errorLog(format string, v ...interface{}) {
 	log.Printf("ERROR: "+format, v...)
@@ -34,21 +28,15 @@ func init() {
 	if env == "" {
 		env = "development"
 	}
-	log.Printf("Starting server in %s mode", env)
 
 	// Try to load environment-specific file first
 	envFile := fmt.Sprintf(".env.%s", env)
 	err := godotenv.Load(envFile)
 	if err != nil {
-		log.Printf("Error loading %s: %v", envFile, err)
 		// Fallback to .env file
 		if err := godotenv.Load(); err != nil {
 			log.Printf("Error loading .env: %v", err)
-		} else {
-			log.Printf("Loaded configuration from .env")
 		}
-	} else {
-		log.Printf("Loaded configuration from %s", envFile)
 	}
 
 	// Set production mode after loading env files
@@ -86,7 +74,6 @@ func NewServer() *Server {
 	redisPort := os.Getenv("REDIS_PORT")
 	redisAddr := fmt.Sprintf("%s:%s", redisHost, redisPort)
 
-	log.Printf("Connecting to Redis at %s", redisAddr)
 	if redisHost == "" || redisPort == "" {
 		log.Fatalf("Redis host or port is empty - Host: '%s', Port: '%s'", redisHost, redisPort)
 	}
@@ -101,21 +88,14 @@ func NewServer() *Server {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("Redis connection options: %+v", opts)
 	redisClient := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if _, err := redisClient.Ping(ctx).Result(); err != nil {
-		log.Printf("Redis connection details - Host: %s, Port: %s, Username: %s, Password set: %v",
-			redisHost,
-			redisPort,
-			opts.Username,
-			opts.Password != "")
 		log.Fatalf("Failed to connect to Redis at %s: %v", redisAddr, err)
 	}
-	log.Printf("Successfully connected to Redis at %s", redisAddr)
 
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -153,8 +133,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	clientID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
-	debugLog("New client connected: %s", clientID)
-
 	messages := make(chan Message, 100)
 	errors := make(chan error, 10)
 	done := make(chan struct{})
@@ -167,7 +145,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		close(messages)
 		close(errors)
 		s.clients.Delete(clientID)
-		debugLog("Client disconnected: %s", clientID)
 	}
 	defer cleanup()
 
@@ -181,12 +158,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			errorLog("Error initializing counter: %v", err)
 			return
 		}
-		debugLog("Initialized counter to 0")
 	} else if err != nil {
 		errorLog("Redis error: %v", err)
 		return
 	}
-	debugLog("Got initial count: %d", count)
 
 	// Send initial count
 	conn.SetWriteDeadline(time.Now().Add(writeWait))
@@ -364,7 +339,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("Counter WebSocket server starting on port %s", port)
+
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
