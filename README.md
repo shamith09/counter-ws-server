@@ -29,4 +29,4 @@ This server is designed to be deployed on Railway. To deploy:
 1. Create a new project on Railway
 2. Connect this repository
 3. Add environment variables
-4. Deploy! 
+4. Deploy!

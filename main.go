@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,8 +12,10 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
 var ctx = context.Background()
@@ -47,11 +50,17 @@ type Server struct {
 	clients     sync.Map
 	redisClient *redis.Client
 	upgrader    websocket.Upgrader
+	db          *sql.DB
 }
 
 type Message struct {
-	Type  string `json:"type"`
-	Count int64  `json:"count"`
+	Type        string `json:"type"`
+	Count       int64  `json:"count"`
+	CountryCode string `json:"country_code"`
+	CountryName string `json:"country_name"`
+	UserID      string `json:"user_id,omitempty"`
+	Amount      int64  `json:"amount"`
+	Operation   string `json:"operation,omitempty"` // "increment" or "multiply"
 }
 
 const (
@@ -97,6 +106,24 @@ func NewServer() *Server {
 		log.Fatalf("Failed to connect to Redis at %s: %v", redisAddr, err)
 	}
 
+	// Connect to PostgreSQL
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_HOST"),
+		os.Getenv("POSTGRES_PORT"),
+		os.Getenv("POSTGRES_DB"),
+	)
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Failed to ping database: %v", err)
+	}
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -109,6 +136,7 @@ func NewServer() *Server {
 	return &Server{
 		redisClient: redisClient,
 		upgrader:    upgrader,
+		db:          db,
 	}
 }
 
@@ -132,6 +160,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	// Add close handler
+	conn.SetCloseHandler(func(code int, text string) error {
+		log.Printf("Client requested close with code %d: %s", code, text)
+		if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
+			// Send close message back to client for clean shutdown
+			message := websocket.FormatCloseMessage(code, "")
+			conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(writeWait))
+		}
+		return nil
+	})
+
 	clientID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
 	messages := make(chan Message, 100)
 	errors := make(chan error, 10)
@@ -139,12 +178,35 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	cleanup := func() {
-		close(done)
+		select {
+		case <-done:
+			return
+		default:
+			close(done)
+		}
+
+		// Try to send close frame
+		message := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Server shutting down")
+		conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(writeWait))
+
 		conn.Close()
 		wg.Wait()
-		close(messages)
-		close(errors)
+
+		// Clean up channels
+		select {
+		case <-messages:
+		default:
+			close(messages)
+		}
+
+		select {
+		case <-errors:
+		default:
+			close(errors)
+		}
+
 		s.clients.Delete(clientID)
+		log.Printf("Cleaned up client %s", clientID)
 	}
 	defer cleanup()
 
@@ -197,7 +259,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			case msg := <-pubsub.Channel():
 				var data struct {
-					Count int64 `json:"count"`
+					Count     int64  `json:"count"`
+					Operation string `json:"operation"`
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
 					errorLog("Error unmarshaling message: %v", err)
@@ -205,7 +268,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				select {
-				case messages <- Message{Type: "count", Count: data.Count}:
+				case messages <- Message{Type: "count", Count: data.Count, Operation: data.Operation}:
 				case <-done:
 					return
 				default:
@@ -226,24 +289,124 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			default:
 				var msg Message
 				if err := conn.ReadJSON(&msg); err != nil {
-					if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					if websocket.IsUnexpectedCloseError(err,
+						websocket.CloseNormalClosure,
+						websocket.CloseGoingAway,
+						websocket.CloseNoStatusReceived) {
 						errorLog("WebSocket read error: %v", err)
 						select {
 						case errors <- fmt.Errorf("read error: %v", err):
 						case <-done:
 						}
+					} else {
+						log.Printf("Client %s closed connection normally", clientID)
 					}
 					return
 				}
 
 				switch msg.Type {
+				case "close":
+					log.Printf("Received close message from client %s", clientID)
+					return
 				case "increment":
-					select {
-					case messages <- msg:
-					case <-done:
-						return
-					default:
-						errorLog("Message channel full, dropping increment")
+					// Handle user ID (can be UUID or OAuth ID)
+					var userIDQuery string
+					if msg.UserID != "" {
+						// Try UUID first
+						if _, err := uuid.Parse(msg.UserID); err == nil {
+							userIDQuery = "id = $1"
+						} else {
+							// If not UUID, try OAuth ID
+							userIDQuery = "oauth_id = $1"
+						}
+					}
+
+					var newCount int64
+					var err error
+					if msg.Operation == "multiply" {
+						// Get current count and multiply
+						currentCount, err := s.redisClient.Get(ctx, "counter").Int64()
+						if err != nil {
+							errorLog("Redis get error: %v", err)
+							continue
+						}
+						newCount = currentCount * 2
+						err = s.redisClient.Set(ctx, "counter", newCount, 0).Err()
+					} else {
+						// Normal increment
+						newCount, err = s.redisClient.Incr(ctx, "counter").Result()
+					}
+
+					if err != nil {
+						errorLog("Redis operation error: %v", err)
+						continue
+					}
+
+					// Update stats in background
+					if msg.UserID != "" {
+						go func(userID string, amount int64, countryCode, countryName string, operation string) {
+							// First get the actual UUID from users table
+							var dbUserID uuid.UUID
+							err := s.db.QueryRowContext(context.Background(),
+								fmt.Sprintf("SELECT id FROM users WHERE %s", userIDQuery),
+								userID).Scan(&dbUserID)
+							if err != nil {
+								errorLog("Error finding user: %v", err)
+								return
+							}
+
+							valueAdded := amount
+							if operation == "multiply" {
+								valueAdded = amount // amount will be the difference from previous count
+							}
+
+							// Update user_stats table with the actual UUID
+							_, err = s.db.ExecContext(context.Background(), `
+								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
+								VALUES ($1, 1, $2, NOW())
+								ON CONFLICT (user_id)
+								DO UPDATE SET
+									increment_count = user_stats.increment_count + 1,
+									total_value_added = user_stats.total_value_added + $2,
+									last_increment = NOW()
+							`, dbUserID, valueAdded)
+							if err != nil {
+								errorLog("Error updating user stats: %v", err)
+							}
+
+							// Update country stats if country info is provided
+							if countryCode != "" && countryName != "" {
+								_, err = s.db.ExecContext(context.Background(), `
+									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
+									VALUES ($1, $2, 1, NOW())
+									ON CONFLICT (country_code)
+									DO UPDATE SET
+										increment_count = country_stats.increment_count + 1,
+										last_increment = NOW()
+								`, countryCode, countryName)
+								if err != nil {
+									errorLog("Error updating country stats: %v", err)
+								}
+							}
+						}(msg.UserID, msg.Amount, msg.CountryCode, msg.CountryName, msg.Operation)
+					}
+
+					data := struct {
+						Count     int64  `json:"count"`
+						Operation string `json:"operation"`
+					}{
+						Count:     newCount,
+						Operation: msg.Operation,
+					}
+
+					countBytes, err := json.Marshal(data)
+					if err != nil {
+						errorLog("Error marshaling count: %v", err)
+						continue
+					}
+
+					if err := s.redisClient.Publish(ctx, "counter-channel", string(countBytes)).Err(); err != nil {
+						errorLog("Error publishing count: %v", err)
 					}
 				case "ping":
 					conn.SetWriteDeadline(time.Now().Add(writeWait))
@@ -279,8 +442,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 
 				data := struct {
-					Count int64 `json:"count"`
-				}{Count: newCount}
+					Count     int64  `json:"count"`
+					Operation string `json:"operation"`
+				}{
+					Count:     newCount,
+					Operation: msg.Operation,
+				}
 
 				countBytes, err := json.Marshal(data)
 				if err != nil {
