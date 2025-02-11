@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"sync"
@@ -19,7 +20,6 @@ import (
 )
 
 var ctx = context.Background()
-var isProduction = false
 
 // errorLog always logs errors
 func errorLog(format string, v ...interface{}) {
@@ -41,9 +41,6 @@ func init() {
 			log.Printf("Error loading .env: %v", err)
 		}
 	}
-
-	// Set production mode after loading env files
-	isProduction = os.Getenv("GO_ENV") == "production"
 }
 
 type Server struct {
@@ -51,16 +48,17 @@ type Server struct {
 	redisClient *redis.Client
 	upgrader    websocket.Upgrader
 	db          *sql.DB
+	incrScript  *redis.Script
 }
 
 type Message struct {
 	Type        string `json:"type"`
-	Count       int64  `json:"count"`
+	Count       string `json:"count"`
 	CountryCode string `json:"country_code"`
 	CountryName string `json:"country_name"`
 	UserID      string `json:"user_id,omitempty"`
-	Amount      int64  `json:"amount"`
-	Operation   string `json:"operation,omitempty"` // "increment" or "multiply"
+	Amount      string `json:"amount"`
+	Operation   string `json:"operation,omitempty"`
 }
 
 const (
@@ -87,6 +85,14 @@ func NewServer() *Server {
 		log.Fatalf("Redis host or port is empty - Host: '%s', Port: '%s'", redisHost, redisPort)
 	}
 
+	// Load the Lua script
+	scriptBytes, err := os.ReadFile("bignum.lua")
+	if err != nil {
+		log.Fatalf("Failed to read Lua script: %v", err)
+	}
+
+	incrScript := redis.NewScript(string(scriptBytes))
+
 	opts := &redis.Options{
 		Addr:         redisAddr,
 		Username:     os.Getenv("REDIS_USERNAME"),
@@ -104,6 +110,11 @@ func NewServer() *Server {
 
 	if _, err := redisClient.Ping(ctx).Result(); err != nil {
 		log.Fatalf("Failed to connect to Redis at %s: %v", redisAddr, err)
+	}
+
+	// Load the script into Redis
+	if err := incrScript.Load(ctx, redisClient).Err(); err != nil {
+		log.Fatalf("Failed to load Lua script: %v", err)
 	}
 
 	// Connect to PostgreSQL
@@ -137,7 +148,19 @@ func NewServer() *Server {
 		redisClient: redisClient,
 		upgrader:    upgrader,
 		db:          db,
+		incrScript:  incrScript,
 	}
+}
+
+// Replace the Redis Incr calls with our Lua script
+func (s *Server) incrementCounter(ctx context.Context, amount string) (string, error) {
+	log.Printf("Executing increment script with amount: %s", amount)
+	result, err := s.incrScript.Run(ctx, s.redisClient, []string{"counter"}, amount).Result()
+	if err != nil {
+		return "", fmt.Errorf("failed to execute increment script: %v", err)
+	}
+	log.Printf("Increment script result: %v", result)
+	return result.(string), nil
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -213,9 +236,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.clients.Store(clientID, conn)
 
 	// Get initial count
-	count, err := s.redisClient.Get(ctx, "counter").Int64()
+	count, err := s.redisClient.Get(ctx, "counter").Result()
 	if err == redis.Nil {
-		count = 0
+		count = "0"
 		if err := s.redisClient.Set(ctx, "counter", "0", 0).Err(); err != nil {
 			errorLog("Error initializing counter: %v", err)
 			return
@@ -226,8 +249,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send initial count
-	conn.SetWriteDeadline(time.Now().Add(writeWait))
-	initialMsg := Message{Type: "count", Count: count}
+	initialCount := new(big.Int)
+	initialCount.SetString(count, 10)
+	initialMsg := Message{Type: "count", Count: initialCount.String()}
 	if err := conn.WriteJSON(initialMsg); err != nil {
 		errorLog("Error sending initial count: %v", err)
 		return
@@ -259,7 +283,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			case msg := <-pubsub.Channel():
 				var data struct {
-					Count     int64  `json:"count"`
+					Count     string `json:"count"`
 					Operation string `json:"operation"`
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
@@ -267,8 +291,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
+				msgCount := new(big.Int)
+				msgCount.SetString(data.Count, 10)
 				select {
-				case messages <- Message{Type: "count", Count: data.Count, Operation: data.Operation}:
+				case messages <- Message{
+					Type:      "count",
+					Count:     msgCount.String(),
+					Operation: data.Operation,
+				}:
 				case <-done:
 					return
 				default:
@@ -321,30 +351,41 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
-					var newCount int64
+					var newCount string
 					var err error
 					if msg.Operation == "multiply" {
 						// Get current count and multiply
-						currentCount, err := s.redisClient.Get(ctx, "counter").Int64()
+						currentCount, err := s.redisClient.Get(ctx, "counter").Result()
 						if err != nil {
 							errorLog("Redis get error: %v", err)
 							continue
 						}
-						newCount = currentCount * 2
-						err = s.redisClient.Set(ctx, "counter", newCount, 0).Err()
+						log.Printf("Current count before multiply: %s", currentCount)
+						// Double the current count
+						newCount, err = s.incrementCounter(ctx, currentCount)
+						if err != nil {
+							errorLog("Redis multiply error: %v", err)
+							continue
+						}
+						log.Printf("New count after multiply: %s", newCount)
 					} else {
 						// Normal increment
-						newCount, err = s.redisClient.Incr(ctx, "counter").Result()
+						newCount, err = s.incrementCounter(ctx, "1")
+						if err != nil {
+							errorLog("Redis increment error: %v", err)
+							continue
+						}
+						log.Printf("New count after increment: %s", newCount)
 					}
 
-					if err != nil {
-						errorLog("Redis operation error: %v", err)
-						continue
-					}
+					// Parse the string count to big.Int for the message
+					parsedCount := new(big.Int)
+					parsedCount.SetString(newCount, 10)
+					log.Printf("Parsed count as big.Int: %s", parsedCount.String())
 
 					// Update stats in background
 					if msg.UserID != "" {
-						go func(userID string, amount int64, countryCode, countryName string, operation string) {
+						go func(userID string, amountStr, countryCode, countryName string, operation string) {
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
 							err := s.db.QueryRowContext(context.Background(),
@@ -355,10 +396,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 								return
 							}
 
-							valueAdded := amount
-							if operation == "multiply" {
-								valueAdded = amount // amount will be the difference from previous count
-							}
+							valueAdded := new(big.Int)
+							valueAdded.SetString(amountStr, 10)
 
 							// Update user_stats table with the actual UUID
 							_, err = s.db.ExecContext(context.Background(), `
@@ -392,12 +431,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					}
 
 					data := struct {
-						Count     int64  `json:"count"`
+						Count     string `json:"count"`
 						Operation string `json:"operation"`
 					}{
-						Count:     newCount,
+						Count:     parsedCount.String(),
 						Operation: msg.Operation,
 					}
+					log.Printf("Publishing message with count: %s, operation: %s", data.Count, data.Operation)
 
 					countBytes, err := json.Marshal(data)
 					if err != nil {
@@ -441,11 +481,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
+				newCountBig := new(big.Int)
+				newCountBig.SetInt64(newCount)
 				data := struct {
-					Count     int64  `json:"count"`
+					Count     string `json:"count"`
 					Operation string `json:"operation"`
 				}{
-					Count:     newCount,
+					Count:     newCountBig.String(),
 					Operation: msg.Operation,
 				}
 
@@ -472,7 +514,7 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				count, err := s.redisClient.Get(ctx, "counter").Int64()
+				count, err := s.redisClient.Get(ctx, "counter").Result()
 				if err != nil && err != redis.Nil {
 					errorLog("Error getting counter for history: %v", err)
 					continue
@@ -480,7 +522,7 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 
 				// Store as a sorted set with timestamp as score
 				now := float64(time.Now().Unix())
-				member := fmt.Sprintf("%d:%d", time.Now().Unix(), count)
+				member := fmt.Sprintf("%d:%s", time.Now().Unix(), count)
 				if err := s.redisClient.ZAdd(ctx, counterHistoryKey, &redis.Z{
 					Score:  now,
 					Member: member,
@@ -500,6 +542,7 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 
 func main() {
 	server := NewServer()
+	go server.startHistoryLogger(ctx)
 	http.HandleFunc("/ws", server.handleWebSocket)
 
 	port := os.Getenv("PORT")
