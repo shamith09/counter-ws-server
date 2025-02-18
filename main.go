@@ -167,12 +167,10 @@ func NewServer() *Server {
 
 // Replace the Redis Incr calls with our Lua script
 func (s *Server) incrementCounter(ctx context.Context, amount string) (string, error) {
-	log.Printf("Executing increment script with amount: %s", amount)
 	result, err := s.incrScript.Run(ctx, s.redisClient, []string{"counter"}, amount).Result()
 	if err != nil {
 		return "", fmt.Errorf("failed to execute increment script: %v", err)
 	}
-	log.Printf("Increment script result: %v", result)
 	return result.(string), nil
 }
 
@@ -410,7 +408,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							errorLog("Redis multiply error: %v", err)
 							continue
 						}
-						log.Printf("New count after multiply by %d: %s", multiplyAmount, newCount)
 					} else {
 						// Normal increment
 						valueDiff = new(big.Int).SetInt64(1)
@@ -419,13 +416,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							errorLog("Redis increment error: %v", err)
 							continue
 						}
-						log.Printf("New count after increment: %s", newCount)
 					}
 
 					// Parse the string count to big.Int for the message
 					parsedCount := new(big.Int)
 					parsedCount.SetString(newCount, 10)
-					log.Printf("Parsed count as big.Int: %s", parsedCount.String())
 
 					// Update stats in background
 					if msg.UserID != "" {
@@ -442,29 +437,48 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							// Update user_stats table with the actual UUID
 							_, err = s.db.ExecContext(context.Background(), `
-								INSERT INTO user_stats (user_id, increment_count, last_increment)
-								VALUES ($1, $2, NOW())
+								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
+								VALUES ($1, 1, $2, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
-									increment_count = user_stats.increment_count + $2,
+									increment_count = user_stats.increment_count + 1,
+									total_value_added = user_stats.total_value_added + $2,
 									last_increment = NOW()
 							`, dbUserID, valueDiff.String())
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							}
 
+							// Insert user activity
+							_, err = s.db.ExecContext(context.Background(), `
+								INSERT INTO user_activity (user_id, value_diff, created_at)
+								VALUES ($1, $2, NOW())
+							`, dbUserID, valueDiff.String())
+							if err != nil {
+								errorLog("Error inserting user activity: %v", err)
+							}
+
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
 								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
-									VALUES ($1, $2, $3, NOW())
+									VALUES ($1, $2, 1, NOW())
 									ON CONFLICT (country_code)
 									DO UPDATE SET
-										increment_count = country_stats.increment_count + $3,
+										increment_count = country_stats.increment_count + 1,
 										last_increment = NOW()
-								`, countryCode, countryName, valueDiff.String())
+								`, countryCode, countryName)
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
+								}
+
+								// Insert country activity
+								_, err = s.db.ExecContext(context.Background(), `
+									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
+									VALUES ($1, $2, $3, NOW())
+								`, countryCode, countryName, valueDiff.String())
+								if err != nil {
+									errorLog("Error inserting country activity: %v", err)
 								}
 							}
 						}(msg.UserID, valueDiff, msg.CountryCode, msg.CountryName, msg.Operation)
@@ -479,7 +493,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						Operation:      msg.Operation,
 						MultiplyAmount: msg.MultiplyAmount,
 					}
-					log.Printf("Publishing message with count: %s, operation: %s", data.Count, data.Operation)
 
 					countBytes, err := json.Marshal(data)
 					if err != nil {
