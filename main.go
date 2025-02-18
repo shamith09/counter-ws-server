@@ -52,13 +52,26 @@ type Server struct {
 }
 
 type Message struct {
-	Type        string `json:"type"`
-	Count       string `json:"count"`
-	CountryCode string `json:"country_code"`
-	CountryName string `json:"country_name"`
-	UserID      string `json:"user_id,omitempty"`
-	Amount      string `json:"amount"`
-	Operation   string `json:"operation,omitempty"`
+	Type           string `json:"type"`
+	Count          string `json:"count"`
+	Operation      string `json:"operation"`
+	MultiplyAmount int    `json:"multiply_amount,omitempty"`
+	UserID         string `json:"user_id,omitempty"`
+	Amount         string `json:"amount,omitempty"`
+	CountryCode    string `json:"country_code,omitempty"`
+	CountryName    string `json:"country_name,omitempty"`
+}
+
+type CounterMessage struct {
+	Count          string `json:"count"`
+	Operation      string `json:"operation"`
+	MultiplyAmount int    `json:"multiply_amount,omitempty"`
+}
+
+type CounterState struct {
+	Count          string `json:"count"`
+	Operation      string `json:"operation"`
+	MultiplyAmount int    `json:"multiply_amount,omitempty"`
 }
 
 const (
@@ -282,22 +295,37 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case msg := <-pubsub.Channel():
+				if msg == nil {
+					errors <- fmt.Errorf("received nil message from Redis pubsub")
+					continue
+				}
 				var data struct {
-					Count     string `json:"count"`
-					Operation string `json:"operation"`
+					Count          string `json:"count"`
+					Operation      string `json:"operation"`
+					MultiplyAmount int    `json:"multiply_amount,omitempty"`
 				}
 				if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
 					errorLog("Error unmarshaling message: %v", err)
 					errors <- fmt.Errorf("error unmarshaling message: %v", err)
 					continue
 				}
+				if data.Count == "" {
+					errorLog("Received empty count in message")
+					errors <- fmt.Errorf("received empty count in message")
+					continue
+				}
 				msgCount := new(big.Int)
-				msgCount.SetString(data.Count, 10)
+				if _, ok := msgCount.SetString(data.Count, 10); !ok {
+					errorLog("Invalid count format: %s", data.Count)
+					errors <- fmt.Errorf("invalid count format: %s", data.Count)
+					continue
+				}
 				select {
 				case messages <- Message{
-					Type:      "count",
-					Count:     msgCount.String(),
-					Operation: data.Operation,
+					Type:           "count",
+					Count:          msgCount.String(),
+					Operation:      data.Operation,
+					MultiplyAmount: data.MultiplyAmount,
 				}:
 				case <-done:
 					return
@@ -351,25 +379,41 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
+					// Get current count before any operation
+					currentCount, err := s.redisClient.Get(ctx, "counter").Result()
+					if err != nil {
+						errorLog("Redis get error: %v", err)
+						continue
+					}
+					currentBig := new(big.Int)
+					currentBig.SetString(currentCount, 10)
+
 					var newCount string
-					var err error
+					var valueDiff *big.Int
 					if msg.Operation == "multiply" {
-						// Get current count and multiply
-						currentCount, err := s.redisClient.Get(ctx, "counter").Result()
-						if err != nil {
-							errorLog("Redis get error: %v", err)
-							continue
+						// If no multiply amount specified, default to 2
+						multiplyAmount := 2
+						if msg.MultiplyAmount > 0 {
+							multiplyAmount = msg.MultiplyAmount
 						}
-						log.Printf("Current count before multiply: %s", currentCount)
-						// Double the current count
-						newCount, err = s.incrementCounter(ctx, currentCount)
-						if err != nil {
+
+						// Calculate new value
+						multiplier := new(big.Int).SetInt64(int64(multiplyAmount))
+						result := new(big.Int).Mul(currentBig, multiplier)
+
+						// Calculate the difference
+						valueDiff = new(big.Int).Sub(result, currentBig)
+
+						// Store the result
+						newCount = result.String()
+						if err := s.redisClient.Set(ctx, "counter", newCount, 0).Err(); err != nil {
 							errorLog("Redis multiply error: %v", err)
 							continue
 						}
-						log.Printf("New count after multiply: %s", newCount)
+						log.Printf("New count after multiply by %d: %s", multiplyAmount, newCount)
 					} else {
 						// Normal increment
+						valueDiff = new(big.Int).SetInt64(1)
 						newCount, err = s.incrementCounter(ctx, "1")
 						if err != nil {
 							errorLog("Redis increment error: %v", err)
@@ -385,7 +429,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 					// Update stats in background
 					if msg.UserID != "" {
-						go func(userID string, amountStr, countryCode, countryName string, operation string) {
+						go func(userID string, valueDiff *big.Int, countryCode, countryName string, operation string) {
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
 							err := s.db.QueryRowContext(context.Background(),
@@ -396,19 +440,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 								return
 							}
 
-							valueAdded := new(big.Int)
-							valueAdded.SetString(amountStr, 10)
-
 							// Update user_stats table with the actual UUID
 							_, err = s.db.ExecContext(context.Background(), `
-								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
-								VALUES ($1, 1, $2, NOW())
+								INSERT INTO user_stats (user_id, increment_count, last_increment)
+								VALUES ($1, $2, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
-									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + $2,
+									increment_count = user_stats.increment_count + $2,
 									last_increment = NOW()
-							`, dbUserID, valueAdded)
+							`, dbUserID, valueDiff.String())
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							}
@@ -417,25 +457,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							if countryCode != "" && countryName != "" {
 								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
-									VALUES ($1, $2, 1, NOW())
+									VALUES ($1, $2, $3, NOW())
 									ON CONFLICT (country_code)
 									DO UPDATE SET
-										increment_count = country_stats.increment_count + 1,
+										increment_count = country_stats.increment_count + $3,
 										last_increment = NOW()
-								`, countryCode, countryName)
+								`, countryCode, countryName, valueDiff.String())
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
 								}
 							}
-						}(msg.UserID, msg.Amount, msg.CountryCode, msg.CountryName, msg.Operation)
+						}(msg.UserID, valueDiff, msg.CountryCode, msg.CountryName, msg.Operation)
 					}
 
 					data := struct {
-						Count     string `json:"count"`
-						Operation string `json:"operation"`
+						Count          string `json:"count"`
+						Operation      string `json:"operation"`
+						MultiplyAmount int    `json:"multiply_amount,omitempty"`
 					}{
-						Count:     parsedCount.String(),
-						Operation: msg.Operation,
+						Count:          parsedCount.String(),
+						Operation:      msg.Operation,
+						MultiplyAmount: msg.MultiplyAmount,
 					}
 					log.Printf("Publishing message with count: %s, operation: %s", data.Count, data.Operation)
 
@@ -484,11 +526,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				newCountBig := new(big.Int)
 				newCountBig.SetInt64(newCount)
 				data := struct {
-					Count     string `json:"count"`
-					Operation string `json:"operation"`
+					Count          string `json:"count"`
+					Operation      string `json:"operation"`
+					MultiplyAmount int    `json:"multiply_amount,omitempty"`
 				}{
-					Count:     newCountBig.String(),
-					Operation: msg.Operation,
+					Count:          newCountBig.String(),
+					Operation:      msg.Operation,
+					MultiplyAmount: msg.MultiplyAmount,
 				}
 
 				countBytes, err := json.Marshal(data)
