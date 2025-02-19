@@ -389,6 +389,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					var newCount string
 					var valueDiff *big.Int
 					if msg.Operation == "multiply" {
+						// Skip multiplication if amount is less than 1
+						if msg.MultiplyAmount < 1 {
+							continue
+						}
+
 						// If no multiply amount specified, default to 2
 						multiplyAmount := 2
 						if msg.MultiplyAmount > 0 {
