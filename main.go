@@ -86,7 +86,7 @@ const (
 
 	// Counter history keys
 	counterHistoryKey = "counter_history" // Sorted set for counter history
-	historyInterval   = 5 * time.Minute   // Log counter every 5 minutes
+	historyInterval   = 1 * time.Minute   // Log counter every minute for more detailed history
 )
 
 func NewServer() *Server {
@@ -583,24 +583,131 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 					continue
 				}
 
-				// Store as a sorted set with timestamp as score
-				now := float64(time.Now().Unix())
-				member := fmt.Sprintf("%d:%s", time.Now().Unix(), count)
-				if err := s.redisClient.ZAdd(ctx, counterHistoryKey, &redis.Z{
-					Score:  now,
-					Member: member,
-				}).Err(); err != nil {
-					errorLog("Error storing counter history: %v", err)
+				// Store in PostgreSQL counter_history table as a string
+				_, err = s.db.ExecContext(ctx, 
+					`INSERT INTO counter_history (count, timestamp, granularity) 
+					 VALUES ($1, NOW(), 'detailed')
+					 ON CONFLICT (timestamp, granularity) 
+					 DO UPDATE SET count = $1`,
+					count)
+				
+				if err != nil {
+					errorLog("Error storing counter history in PostgreSQL: %v", err)
 				}
 
-				// Cleanup old entries (keep last 30 days)
-				cutoff := float64(time.Now().Add(-30 * 24 * time.Hour).Unix())
-				if err := s.redisClient.ZRemRangeByScore(ctx, counterHistoryKey, "-inf", fmt.Sprintf("%f", cutoff)).Err(); err != nil {
-					errorLog("Error cleaning up counter history: %v", err)
+				// Periodically aggregate detailed records into hourly and daily records
+				// This is done less frequently to avoid excessive database operations
+				hour := time.Now().Hour()
+				minute := time.Now().Minute()
+				
+				// Run hourly aggregation at the start of each hour
+				if minute < 5 {
+					s.aggregateCounterHistory(ctx)
+				}
+				
+				// Clean up old detailed records once a day at 1:00 AM
+				if hour == 1 && minute < 5 {
+					s.cleanupOldRecords(ctx)
 				}
 			}
 		}
 	}()
+}
+
+func (s *Server) aggregateCounterHistory(ctx context.Context) {
+	// Aggregate detailed records into hourly records for the previous hour
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
+		SELECT 
+			last(count, timestamp) as count,
+			date_trunc('hour', timestamp) as hour_timestamp,
+			'hourly' as granularity,
+			first(count, timestamp) as start_count,
+			last(count, timestamp) as end_count,
+			last(count, timestamp) as avg_count, -- Using last count as avg since we can't average strings
+			min(count) as min_count,             -- This works for lexicographical comparison
+			max(count) as max_count              -- This works for lexicographical comparison
+		FROM counter_history
+		WHERE 
+			granularity = 'detailed' AND
+			timestamp >= date_trunc('hour', NOW() - INTERVAL '1 hour') AND
+			timestamp < date_trunc('hour', NOW())
+		GROUP BY hour_timestamp
+		ON CONFLICT (timestamp, granularity)
+		DO UPDATE SET 
+			count = EXCLUDED.count,
+			start_count = EXCLUDED.start_count,
+			end_count = EXCLUDED.end_count,
+			avg_count = EXCLUDED.avg_count,
+			min_count = EXCLUDED.min_count,
+			max_count = EXCLUDED.max_count
+	`)
+	
+	if err != nil {
+		errorLog("Error aggregating hourly counter history: %v", err)
+	}
+
+	// At midnight, also aggregate the previous day's hourly records into a daily record
+	if time.Now().Hour() == 0 {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
+			SELECT 
+				last(count, timestamp) as count,
+				date_trunc('day', timestamp) as day_timestamp,
+				'daily' as granularity,
+				first(count, timestamp) as start_count,
+				last(count, timestamp) as end_count,
+				last(count, timestamp) as avg_count, -- Using last count as avg since we can't average strings
+				min(count) as min_count,             -- This works for lexicographical comparison
+				max(count) as max_count              -- This works for lexicographical comparison
+			FROM counter_history
+			WHERE 
+				granularity = 'hourly' AND
+				timestamp >= date_trunc('day', NOW() - INTERVAL '1 day') AND
+				timestamp < date_trunc('day', NOW())
+			GROUP BY day_timestamp
+			ON CONFLICT (timestamp, granularity)
+			DO UPDATE SET 
+				count = EXCLUDED.count,
+				start_count = EXCLUDED.start_count,
+				end_count = EXCLUDED.end_count,
+				avg_count = EXCLUDED.avg_count,
+				min_count = EXCLUDED.min_count,
+				max_count = EXCLUDED.max_count
+		`)
+		
+		if err != nil {
+			errorLog("Error aggregating daily counter history: %v", err)
+		}
+	}
+}
+
+func (s *Server) cleanupOldRecords(ctx context.Context) {
+	// Keep detailed records for 7 days
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM counter_history 
+		WHERE 
+			granularity = 'detailed' AND 
+			timestamp < NOW() - INTERVAL '7 days'
+	`)
+	
+	if err != nil {
+		errorLog("Error cleaning up old detailed records: %v", err)
+	}
+	
+	// Keep hourly records for 90 days
+	_, err = s.db.ExecContext(ctx, `
+		DELETE FROM counter_history 
+		WHERE 
+			granularity = 'hourly' AND 
+			timestamp < NOW() - INTERVAL '90 days'
+	`)
+	
+	if err != nil {
+		errorLog("Error cleaning up old hourly records: %v", err)
+	}
+	
+	// Daily records are kept indefinitely for historical analysis
 }
 
 func main() {
