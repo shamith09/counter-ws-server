@@ -443,7 +443,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				switch msg.Type {
 				case "close":
-					log.Printf("Received close message from client %s", clientID)
+					log.Printf("Received close message from client %s: %v", clientID, msg)
 					return
 				case "get_viewer_count":
 					// Send the current viewer count to the requesting client
