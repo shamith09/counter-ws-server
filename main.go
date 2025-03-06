@@ -193,7 +193,7 @@ func (s *Server) updateViewerCount(ctx context.Context) {
 }
 
 func (s *Server) trackViewers(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	go func() {
 		for {
 			select {
