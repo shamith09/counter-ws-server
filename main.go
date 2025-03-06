@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -175,6 +176,56 @@ func (s *Server) incrementCounter(ctx context.Context, amount string) (string, e
 	return result.(string), nil
 }
 
+func (s *Server) getViewerCount() int {
+	count := 0
+	s.clients.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func (s *Server) updateViewerCount(ctx context.Context) {
+	count := s.getViewerCount()
+	if err := s.redisClient.Set(ctx, "viewer_count", count, 0).Err(); err != nil {
+		errorLog("Error updating viewer count in Redis: %v", err)
+	}
+}
+
+func (s *Server) trackViewers(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				// Update viewer count in Redis
+				s.updateViewerCount(ctx)
+				
+				// Clean up old records from viewers table
+				_, err := s.db.ExecContext(ctx, 
+					`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '10 seconds'`)
+				if err != nil {
+					errorLog("Error cleaning up old viewer records: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
+	count := s.getViewerCount()
+	
+	// Update the count in Redis as well
+	s.updateViewerCount(ctx)
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]int{"count": count})
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		w.WriteHeader(http.StatusOK)
@@ -195,17 +246,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	// Add close handler
-	conn.SetCloseHandler(func(code int, text string) error {
-		log.Printf("Client requested close with code %d: %s", code, text)
-		if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
-			// Send close message back to client for clean shutdown
-			message := websocket.FormatCloseMessage(code, "")
-			conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(writeWait))
-		}
-		return nil
-	})
-
 	clientID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
 	messages := make(chan Message, 100)
 	errors := make(chan error, 10)
@@ -219,6 +259,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		default:
 			close(done)
 		}
+
+		// Remove this client from our map
+		s.clients.Delete(clientID)
+		
+		// Remove this viewer from the database immediately
+		_, err := s.db.ExecContext(ctx, `DELETE FROM viewers WHERE client_id = $1`, clientID)
+		if err != nil {
+			errorLog("Error removing viewer from database: %v", err)
+		}
+		
+		// Update viewer count after client disconnects
+		s.updateViewerCount(ctx)
 
 		// Try to send close frame
 		message := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Server shutting down")
@@ -240,12 +292,36 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			close(errors)
 		}
 
-		s.clients.Delete(clientID)
 		log.Printf("Cleaned up client %s", clientID)
 	}
 	defer cleanup()
 
 	s.clients.Store(clientID, conn)
+	
+	// Track this viewer in the database
+	ipAddress := r.Header.Get("X-Forwarded-For")
+	if ipAddress == "" {
+		// Extract just the IP part from RemoteAddr (remove port if present)
+		ipAddress = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ipAddress); err == nil {
+			ipAddress = host
+		}
+	}
+	
+	// Insert or update viewer record
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
+		VALUES ($1, NOW(), $2, $3)
+		ON CONFLICT (client_id) 
+		DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
+	`, clientID, ipAddress, r.UserAgent())
+	
+	if err != nil {
+		errorLog("Error tracking viewer in database: %v", err)
+	}
+	
+	// Update viewer count after a new client connects
+	s.updateViewerCount(ctx)
 
 	// Get initial count
 	count, err := s.redisClient.Get(ctx, "counter").Result()
@@ -365,6 +441,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				case "close":
 					log.Printf("Received close message from client %s", clientID)
 					return
+				case "get_viewer_count":
+					// Send the current viewer count to the requesting client
+					viewerCount := s.getViewerCount()
+					if err := conn.WriteJSON(Message{
+						Type:  "viewer_count",
+						Count: fmt.Sprintf("%d", viewerCount),
+					}); err != nil {
+						errorLog("Error sending viewer count: %v", err)
+					}
 				case "increment":
 					// Handle user ID (can be UUID or OAuth ID)
 					var userIDQuery string
@@ -510,6 +595,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						errorLog("Error publishing count: %v", err)
 					}
 				case "ping":
+					// Handle ping message - update last_seen timestamp
+					_, err := s.db.ExecContext(ctx, `
+						UPDATE viewers 
+						SET last_seen = NOW() 
+						WHERE client_id = $1
+					`, clientID)
+					
+					if err != nil {
+						errorLog("Error updating viewer timestamp: %v", err)
+					}
+					
+					// No response needed for ping
+				case "pong":
 					conn.SetWriteDeadline(time.Now().Add(writeWait))
 					if err := conn.WriteJSON(Message{Type: "pong"}); err != nil {
 						errorLog("Error sending pong: %v", err)
@@ -522,13 +620,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Main event loop
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case err := <-errors:
-			errorLog("Client error: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
 			return
 		case msg := <-messages:
 			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			
+			// Handle different message types
 			switch msg.Type {
 			case "count":
 				if err := conn.WriteJSON(msg); err != nil {
@@ -536,6 +640,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case "increment":
+				// Handle increment operation
 				newCount, err := s.redisClient.Incr(ctx, "counter").Result()
 				if err != nil {
 					errorLog("Redis increment error: %v", err)
@@ -563,6 +668,31 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if err := s.redisClient.Publish(ctx, "counter-channel", string(countBytes)).Err(); err != nil {
 					errorLog("Error publishing count: %v", err)
 				}
+			case "get_viewer_count":
+				// Send current viewer count
+				viewerCount := s.getViewerCount()
+				response := Message{
+					Type:  "viewer_count",
+					Count: fmt.Sprintf("%d", viewerCount),
+				}
+				if err := conn.WriteJSON(response); err != nil {
+					errorLog("Error sending viewer count: %v", err)
+					return
+				}
+				
+			case "ping":
+				// Handle ping message - update last_seen timestamp
+				_, err := s.db.ExecContext(ctx, `
+					UPDATE viewers 
+					SET last_seen = NOW() 
+					WHERE client_id = $1
+				`, clientID)
+				
+				if err != nil {
+					errorLog("Error updating viewer timestamp: %v", err)
+				}
+				
+				// No response needed for ping
 			}
 		}
 	}
@@ -619,12 +749,12 @@ func (s *Server) aggregateCounterHistory(ctx context.Context) {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
 		SELECT 
-			last(count, timestamp) as count,
+			(array_agg(count ORDER BY timestamp DESC))[1] as count,
 			date_trunc('hour', timestamp) as hour_timestamp,
 			'hourly' as granularity,
-			first(count, timestamp) as start_count,
-			last(count, timestamp) as end_count,
-			last(count, timestamp) as avg_count, -- Using last count as avg since we can't average strings
+			(array_agg(count ORDER BY timestamp ASC))[1] as start_count,
+			(array_agg(count ORDER BY timestamp DESC))[1] as end_count,
+			(array_agg(count ORDER BY timestamp DESC))[1] as avg_count, -- Using last count as avg since we can't average strings
 			min(count) as min_count,             -- This works for lexicographical comparison
 			max(count) as max_count              -- This works for lexicographical comparison
 		FROM counter_history
@@ -652,12 +782,12 @@ func (s *Server) aggregateCounterHistory(ctx context.Context) {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
 			SELECT 
-				last(count, timestamp) as count,
+				(array_agg(count ORDER BY timestamp DESC))[1] as count,
 				date_trunc('day', timestamp) as day_timestamp,
 				'daily' as granularity,
-				first(count, timestamp) as start_count,
-				last(count, timestamp) as end_count,
-				last(count, timestamp) as avg_count, -- Using last count as avg since we can't average strings
+				(array_agg(count ORDER BY timestamp ASC))[1] as start_count,
+				(array_agg(count ORDER BY timestamp DESC))[1] as end_count,
+				(array_agg(count ORDER BY timestamp DESC))[1] as avg_count, -- Using last count as avg since we can't average strings
 				min(count) as min_count,             -- This works for lexicographical comparison
 				max(count) as max_count              -- This works for lexicographical comparison
 			FROM counter_history
@@ -713,7 +843,10 @@ func (s *Server) cleanupOldRecords(ctx context.Context) {
 func main() {
 	server := NewServer()
 	go server.startHistoryLogger(ctx)
+	go server.trackViewers(ctx)
+	
 	http.HandleFunc("/ws", server.handleWebSocket)
+	http.HandleFunc("/viewer-count", server.handleViewerCount)
 
 	port := os.Getenv("PORT")
 	if port == "" {
