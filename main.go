@@ -203,9 +203,9 @@ func (s *Server) trackViewers(ctx context.Context) {
 			case <-ticker.C:
 				// Update viewer count in Redis
 				s.updateViewerCount(ctx)
-				
+
 				// Clean up old records from viewers table
-				_, err := s.db.ExecContext(ctx, 
+				_, err := s.db.ExecContext(ctx,
 					`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '10 seconds'`)
 				if err != nil {
 					errorLog("Error cleaning up old viewer records: %v", err)
@@ -217,10 +217,10 @@ func (s *Server) trackViewers(ctx context.Context) {
 
 func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
 	count := s.getViewerCount()
-	
+
 	// Update the count in Redis as well
 	s.updateViewerCount(ctx)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]int{"count": count})
@@ -262,14 +262,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		// Remove this client from our map
 		s.clients.Delete(clientID)
-		
+
 		// Remove this viewer from the database immediately and update viewer count in a goroutine
 		go func() {
 			_, err := s.db.ExecContext(context.Background(), `DELETE FROM viewers WHERE client_id = $1`, clientID)
 			if err != nil {
 				errorLog("Error removing viewer from database: %v", err)
 			}
-			
+
 			// Update viewer count after client disconnects
 			s.updateViewerCount(context.Background())
 		}()
@@ -299,7 +299,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer cleanup()
 
 	s.clients.Store(clientID, conn)
-	
+
 	// Track this viewer in the database in a goroutine
 	go func() {
 		ipAddress := r.Header.Get("X-Forwarded-For")
@@ -310,19 +310,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				ipAddress = host
 			}
 		}
-		
-		// Insert or update viewer record
-		_, err := s.db.ExecContext(context.Background(), `
+
+		// Insert or update viewer record using direct query
+		query := fmt.Sprintf(`
 			INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
-			VALUES ($1, NOW(), $2, $3)
+			VALUES ('%s', NOW(), '%s', '%s')
 			ON CONFLICT (client_id) 
-			DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
-		`, clientID, ipAddress, r.UserAgent())
-		
+			DO UPDATE SET last_seen = NOW(), ip_address = '%s', user_agent = '%s'
+		`, clientID, ipAddress, r.UserAgent(), ipAddress, r.UserAgent())
+
+		_, err := s.db.ExecContext(context.Background(), query)
+
 		if err != nil {
 			errorLog("Error tracking viewer in database: %v", err)
 		}
-		
+
 		// Update viewer count after a new client connects
 		s.updateViewerCount(context.Background())
 	}()
@@ -443,7 +445,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				switch msg.Type {
 				case "close":
-					log.Printf("Received close message from client %s: %v", clientID, msg)
+					log.Printf("Received close message from client %s", clientID)
 					return
 				case "get_viewer_count":
 					// Send the current viewer count to the requesting client
@@ -455,18 +457,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						errorLog("Error sending viewer count: %v", err)
 					}
 				case "increment":
-					// Handle user ID (can be UUID or OAuth ID)
-					var userIDQuery string
-					if msg.UserID != "" {
-						// Try UUID first
-						if _, err := uuid.Parse(msg.UserID); err == nil {
-							userIDQuery = "id = $1"
-						} else {
-							// If not UUID, try OAuth ID
-							userIDQuery = "oauth_id = $1"
-						}
-					}
-
 					// Get current count before any operation
 					currentCount, err := s.redisClient.Get(ctx, "counter").Result()
 					if err != nil {
@@ -522,56 +512,69 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						go func(userID string, valueDiff *big.Int, countryCode, countryName string, operation string) {
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
-							err := s.db.QueryRowContext(context.Background(),
-								fmt.Sprintf("SELECT id FROM users WHERE %s", userIDQuery),
-								userID).Scan(&dbUserID)
+							var userQuery string
+							if _, err := uuid.Parse(userID); err == nil {
+								userQuery = fmt.Sprintf("SELECT id FROM users WHERE id = '%s'", userID)
+							} else {
+								userQuery = fmt.Sprintf("SELECT id FROM users WHERE oauth_id = '%s'", userID)
+							}
+
+							err := s.db.QueryRowContext(context.Background(), userQuery).Scan(&dbUserID)
 							if err != nil {
 								errorLog("Error finding user: %v", err)
 								return
 							}
 
 							// Update user_stats table with the actual UUID
-							_, err = s.db.ExecContext(context.Background(), `
+							statsQuery := fmt.Sprintf(`
 								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
-								VALUES ($1, 1, $2, NOW())
+								VALUES ('%s', 1, '%s', NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
 									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + $2,
+									total_value_added = user_stats.total_value_added + '%s',
 									last_increment = NOW()
-							`, dbUserID, valueDiff.String())
+							`, dbUserID, valueDiff.String(), valueDiff.String())
+
+							_, err = s.db.ExecContext(context.Background(), statsQuery)
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							}
 
 							// Insert user activity
-							_, err = s.db.ExecContext(context.Background(), `
+							activityQuery := fmt.Sprintf(`
 								INSERT INTO user_activity (user_id, value_diff, created_at)
-								VALUES ($1, $2, NOW())
+								VALUES ('%s', '%s', NOW())
 							`, dbUserID, valueDiff.String())
+
+							_, err = s.db.ExecContext(context.Background(), activityQuery)
 							if err != nil {
 								errorLog("Error inserting user activity: %v", err)
 							}
 
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
-								_, err = s.db.ExecContext(context.Background(), `
+								countryStatsQuery := fmt.Sprintf(`
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
-									VALUES ($1, $2, 1, NOW())
+									VALUES ('%s', '%s', 1, NOW())
 									ON CONFLICT (country_code)
 									DO UPDATE SET
 										increment_count = country_stats.increment_count + 1,
 										last_increment = NOW()
 								`, countryCode, countryName)
+
+								_, err = s.db.ExecContext(context.Background(), countryStatsQuery)
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
 								}
 
 								// Insert country activity
-								_, err = s.db.ExecContext(context.Background(), `
+								countryActivityQuery := fmt.Sprintf(`
 									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
-									VALUES ($1, $2, $3, NOW())
+									VALUES ('%s', '%s', '%s', NOW())
 								`, countryCode, countryName, valueDiff.String())
+
+								_, err = s.db.ExecContext(context.Background(), countryActivityQuery)
 								if err != nil {
 									errorLog("Error inserting country activity: %v", err)
 								}
@@ -601,17 +604,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				case "ping":
 					// Handle ping message - update last_seen timestamp in a goroutine
 					go func() {
-						_, err := s.db.ExecContext(context.Background(), `
+						query := fmt.Sprintf(`
 							UPDATE viewers 
 							SET last_seen = NOW() 
-							WHERE client_id = $1
+							WHERE client_id = '%s'
 						`, clientID)
-						
+
+						_, err := s.db.ExecContext(context.Background(), query)
+
 						if err != nil {
 							errorLog("Error updating viewer timestamp: %v", err)
 						}
 					}()
-					
+
 					// No response needed for ping
 				case "pong":
 					conn.SetWriteDeadline(time.Now().Add(writeWait))
@@ -637,7 +642,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		case msg := <-messages:
 			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			
+
 			// Handle different message types
 			switch msg.Type {
 			case "count":
@@ -685,21 +690,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					errorLog("Error sending viewer count: %v", err)
 					return
 				}
-				
+
 			case "ping":
 				// Handle ping message - update last_seen timestamp in a goroutine
 				go func() {
-					_, err := s.db.ExecContext(context.Background(), `
+					query := fmt.Sprintf(`
 						UPDATE viewers 
 						SET last_seen = NOW() 
-						WHERE client_id = $1
+						WHERE client_id = '%s'
 					`, clientID)
-					
+
+					_, err := s.db.ExecContext(context.Background(), query)
+
 					if err != nil {
 						errorLog("Error updating viewer timestamp: %v", err)
 					}
 				}()
-				
+
 				// No response needed for ping
 			}
 		}
@@ -721,14 +728,11 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 					continue
 				}
 
-				// Store in PostgreSQL counter_history table as a string
-				_, err = s.db.ExecContext(ctx, 
-					`INSERT INTO counter_history (count, timestamp, granularity) 
-					 VALUES ($1, NOW(), 'detailed')
-					 ON CONFLICT (timestamp, granularity) 
-					 DO UPDATE SET count = $1`,
-					count)
-				
+				// Store in PostgreSQL counter_history table using a simple query
+				_, err = s.db.ExecContext(ctx, fmt.Sprintf(
+					"INSERT INTO counter_history (count, timestamp, granularity) VALUES ('%s', NOW(), 'detailed') ON CONFLICT (timestamp, granularity) DO UPDATE SET count = '%s'",
+					count, count))
+
 				if err != nil {
 					errorLog("Error storing counter history in PostgreSQL: %v", err)
 				}
@@ -737,12 +741,12 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 				// This is done less frequently to avoid excessive database operations
 				hour := time.Now().Hour()
 				minute := time.Now().Minute()
-				
+
 				// Run hourly aggregation at the start of each hour
 				if minute < 5 {
 					s.aggregateCounterHistory(ctx)
 				}
-				
+
 				// Clean up old detailed records once a day at 1:00 AM
 				if hour == 1 && minute < 5 {
 					s.cleanupOldRecords(ctx)
@@ -780,7 +784,7 @@ func (s *Server) aggregateCounterHistory(ctx context.Context) {
 			min_count = EXCLUDED.min_count,
 			max_count = EXCLUDED.max_count
 	`)
-	
+
 	if err != nil {
 		errorLog("Error aggregating hourly counter history: %v", err)
 	}
@@ -813,7 +817,7 @@ func (s *Server) aggregateCounterHistory(ctx context.Context) {
 				min_count = EXCLUDED.min_count,
 				max_count = EXCLUDED.max_count
 		`)
-		
+
 		if err != nil {
 			errorLog("Error aggregating daily counter history: %v", err)
 		}
@@ -828,11 +832,11 @@ func (s *Server) cleanupOldRecords(ctx context.Context) {
 			granularity = 'detailed' AND 
 			timestamp < NOW() - INTERVAL '7 days'
 	`)
-	
+
 	if err != nil {
 		errorLog("Error cleaning up old detailed records: %v", err)
 	}
-	
+
 	// Keep hourly records for 90 days
 	_, err = s.db.ExecContext(ctx, `
 		DELETE FROM counter_history 
@@ -840,11 +844,11 @@ func (s *Server) cleanupOldRecords(ctx context.Context) {
 			granularity = 'hourly' AND 
 			timestamp < NOW() - INTERVAL '90 days'
 	`)
-	
+
 	if err != nil {
 		errorLog("Error cleaning up old hourly records: %v", err)
 	}
-	
+
 	// Daily records are kept indefinitely for historical analysis
 }
 
@@ -852,7 +856,7 @@ func main() {
 	server := NewServer()
 	go server.startHistoryLogger(ctx)
 	go server.trackViewers(ctx)
-	
+
 	http.HandleFunc("/ws", server.handleWebSocket)
 	http.HandleFunc("/viewer-count", server.handleViewerCount)
 
