@@ -45,11 +45,22 @@ func init() {
 }
 
 type Server struct {
-	clients     sync.Map
-	redisClient *redis.Client
-	upgrader    websocket.Upgrader
-	db          *sql.DB
-	incrScript  *redis.Script
+	clients        sync.Map
+	redisClient    *redis.Client
+	upgrader       websocket.Upgrader
+	db             *sql.DB
+	incrScript     *redis.Script
+	rateLimiter    sync.Map  // clientID -> lastIncrementTime
+	ipLimiter      sync.Map  // IP -> connectionInfo
+	instanceID     string    // Unique ID for this server instance
+	isLeader       bool      // Whether this instance is the leader
+	leadershipChan chan bool // Channel to notify of leadership changes
+}
+
+// ConnectionInfo tracks connection attempts from an IP
+type ConnectionInfo struct {
+	lastAttempt time.Time
+	count       int
 }
 
 type Message struct {
@@ -159,11 +170,17 @@ func NewServer() *Server {
 		WriteBufferSize:  1024,
 	}
 
+	// Generate a unique ID for this server instance
+	instanceID := fmt.Sprintf("server-%s", uuid.New().String())
+
 	return &Server{
-		redisClient: redisClient,
-		upgrader:    upgrader,
-		db:          db,
-		incrScript:  incrScript,
+		redisClient:    redisClient,
+		upgrader:       upgrader,
+		db:             db,
+		incrScript:     incrScript,
+		instanceID:     instanceID,
+		isLeader:       false,              // Start as non-leader
+		leadershipChan: make(chan bool, 1), // Buffer of 1 to prevent blocking
 	}
 }
 
@@ -192,6 +209,54 @@ func (s *Server) updateViewerCount(ctx context.Context) {
 	}
 }
 
+// isRateLimited checks if a client is rate limited for increment operations
+// Returns true if the client is rate limited and should be blocked
+func (s *Server) isRateLimited(clientID string) bool {
+	// Rate limit: 5 increments per second per client
+	rateLimit := 5 * time.Second
+
+	// Check if client has a recent increment
+	if lastTime, exists := s.rateLimiter.Load(clientID); exists {
+		// If the last increment was less than rateLimit ago, block the request
+		if time.Since(lastTime.(time.Time)) < rateLimit {
+			return true
+		}
+	}
+
+	// Update the last increment time
+	s.rateLimiter.Store(clientID, time.Now())
+	return false
+}
+
+// isIPRateLimited checks if an IP is making too many connection attempts
+// Returns true if the IP should be blocked
+func (s *Server) isIPRateLimited(ipAddress string) bool {
+	// Rate limit: 10 connections per minute per IP
+	const maxConnections = 10
+	const resetPeriod = 1 * time.Minute
+
+	now := time.Now()
+	var info ConnectionInfo
+
+	// Get current connection info for this IP
+	if val, exists := s.ipLimiter.Load(ipAddress); exists {
+		info = val.(ConnectionInfo)
+
+		// Reset counter if it's been more than resetPeriod
+		if now.Sub(info.lastAttempt) > resetPeriod {
+			info.count = 0
+		}
+	}
+
+	// Update connection info
+	info.lastAttempt = now
+	info.count++
+	s.ipLimiter.Store(ipAddress, info)
+
+	// Check if over limit
+	return info.count > maxConnections
+}
+
 func (s *Server) trackViewers(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	go func() {
@@ -215,6 +280,131 @@ func (s *Server) trackViewers(ctx context.Context) {
 	}()
 }
 
+// cleanupRateLimiters periodically removes old entries from rate limiters
+func (s *Server) cleanupRateLimiters(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				now := time.Now()
+
+				// Clean up client rate limiter
+				s.rateLimiter.Range(func(key, value interface{}) bool {
+					lastTime := value.(time.Time)
+					// Remove entries older than 5 minutes
+					if now.Sub(lastTime) > 5*time.Minute {
+						s.rateLimiter.Delete(key)
+					}
+					return true
+				})
+
+				// Clean up IP rate limiter
+				s.ipLimiter.Range(func(key, value interface{}) bool {
+					info := value.(ConnectionInfo)
+					// Remove entries older than 10 minutes
+					if now.Sub(info.lastAttempt) > 10*time.Minute {
+						s.ipLimiter.Delete(key)
+					}
+					return true
+				})
+			}
+		}
+	}()
+}
+
+// runLeaderElection periodically attempts to become the leader
+// Only one instance should be the leader and handle database writes
+func (s *Server) runLeaderElection(ctx context.Context) {
+	const leaderKey = "counter-leader"
+	const leaderTTL = 30 * time.Second
+
+	// Try to become leader immediately
+	s.tryBecomeLeader(leaderKey, leaderTTL)
+
+	// Then try periodically
+	ticker := time.NewTicker(10 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				// Release leadership if we're the leader
+				isLeader := s.isLeader
+
+				if isLeader {
+					s.redisClient.Del(ctx, leaderKey)
+
+					s.isLeader = false
+
+					log.Printf("Instance %s released leadership", s.instanceID)
+
+					// Notify about leadership change
+					select {
+					case s.leadershipChan <- false: // Signal we're no longer leader
+					default: // Don't block if channel is full
+					}
+				}
+				return
+			case <-ticker.C:
+				s.tryBecomeLeader(leaderKey, leaderTTL)
+			}
+		}
+	}()
+}
+
+// tryBecomeLeader attempts to acquire leadership using Redis
+func (s *Server) tryBecomeLeader(leaderKey string, leaderTTL time.Duration) {
+	wasLeader := s.isLeader
+
+	// If we're already the leader, just refresh the TTL
+	if wasLeader {
+		success, err := s.redisClient.Expire(ctx, leaderKey, leaderTTL).Result()
+		if err != nil || !success {
+			log.Printf("Failed to refresh leader key, releasing leadership: %v", err)
+			s.isLeader = false
+
+			// Notify about leadership change
+			select {
+			case s.leadershipChan <- false: // Signal we're no longer leader
+			default: // Don't block if channel is full
+			}
+		}
+		return
+	}
+
+	// Try to acquire leadership with NX (only if key doesn't exist)
+	success, err := s.redisClient.SetNX(ctx, leaderKey, s.instanceID, leaderTTL).Result()
+	if err != nil {
+		log.Printf("Error in leader election: %v", err)
+		return
+	}
+
+	if success {
+		s.isLeader = true
+
+		log.Printf("Instance %s became the leader", s.instanceID)
+
+		// Notify about leadership change
+		select {
+		case s.leadershipChan <- true: // Signal we're now the leader
+		default: // Don't block if channel is full
+		}
+	} else {
+		// Check if the current leader is still alive
+		currentLeader, err := s.redisClient.Get(ctx, leaderKey).Result()
+		if err != nil && err != redis.Nil {
+			log.Printf("Error checking current leader: %v", err)
+			return
+		}
+
+		log.Printf("Current leader is %s, we are %s", currentLeader, s.instanceID)
+	}
+}
+
 func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
 	count := s.getViewerCount()
 
@@ -226,9 +416,44 @@ func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int{"count": count})
 }
 
+// handleHealthCheck provides information about this server instance
+func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	isLeader := s.isLeader
+
+	response := map[string]interface{}{
+		"status":      "ok",
+		"instance_id": s.instanceID,
+		"is_leader":   isLeader,
+		"timestamp":   time.Now().Format(time.RFC3339),
+		"connections": s.getViewerCount(),
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Get client IP address
+	ipAddress := r.Header.Get("X-Forwarded-For")
+	if ipAddress == "" {
+		// Extract just the IP part from RemoteAddr (remove port if present)
+		ipAddress = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ipAddress); err == nil {
+			ipAddress = host
+		}
+	}
+
+	// Check IP rate limiting
+	if s.isIPRateLimited(ipAddress) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("Too many connection attempts. Please try again later."))
 		return
 	}
 
@@ -457,6 +682,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						errorLog("Error sending viewer count: %v", err)
 					}
 				case "increment":
+					// Check rate limiting first
+					if s.isRateLimited(clientID) {
+						// Client is rate limited, send a rate limit message
+						if err := conn.WriteJSON(Message{
+							Type:  "rate_limited",
+							Count: "Too many requests. Please wait a moment.",
+						}); err != nil {
+							errorLog("Error sending rate limit message: %v", err)
+						}
+						continue
+					}
+
 					// Get current count before any operation
 					currentCount, err := s.redisClient.Get(ctx, "counter").Result()
 					if err != nil {
@@ -715,6 +952,48 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) startHistoryLogger(ctx context.Context) {
 	ticker := time.NewTicker(historyInterval)
+
+	// Function to write history to database
+	writeHistory := func() {
+		isLeader := s.isLeader
+
+		// Only the leader should write history to the database
+		if !isLeader {
+			return
+		}
+
+		log.Printf("Leader %s is writing history to database", s.instanceID)
+		count, err := s.redisClient.Get(ctx, "counter").Result()
+		if err != nil && err != redis.Nil {
+			errorLog("Error getting counter for history: %v", err)
+			return
+		}
+
+		// Store in PostgreSQL counter_history table using a simple query
+		_, err = s.db.ExecContext(ctx, fmt.Sprintf(
+			"INSERT INTO counter_history (count, timestamp, granularity) VALUES ('%s', NOW(), 'detailed') ON CONFLICT (timestamp, granularity) DO UPDATE SET count = '%s'",
+			count, count))
+
+		if err != nil {
+			errorLog("Error storing counter history in PostgreSQL: %v", err)
+		}
+
+		// Periodically aggregate detailed records into hourly and daily records
+		// This is done less frequently to avoid excessive database operations
+		hour := time.Now().Hour()
+		minute := time.Now().Minute()
+
+		// Run hourly aggregation at the start of each hour
+		if minute < 5 {
+			s.aggregateCounterHistory(ctx)
+		}
+
+		// Clean up old detailed records once a day at 1:00 AM
+		if hour == 1 && minute < 5 {
+			s.cleanupOldRecords(ctx)
+		}
+	}
+
 	go func() {
 		for {
 			select {
@@ -722,34 +1001,15 @@ func (s *Server) startHistoryLogger(ctx context.Context) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				count, err := s.redisClient.Get(ctx, "counter").Result()
-				if err != nil && err != redis.Nil {
-					errorLog("Error getting counter for history: %v", err)
-					continue
-				}
-
-				// Store in PostgreSQL counter_history table using a simple query
-				_, err = s.db.ExecContext(ctx, fmt.Sprintf(
-					"INSERT INTO counter_history (count, timestamp, granularity) VALUES ('%s', NOW(), 'detailed') ON CONFLICT (timestamp, granularity) DO UPDATE SET count = '%s'",
-					count, count))
-
-				if err != nil {
-					errorLog("Error storing counter history in PostgreSQL: %v", err)
-				}
-
-				// Periodically aggregate detailed records into hourly and daily records
-				// This is done less frequently to avoid excessive database operations
-				hour := time.Now().Hour()
-				minute := time.Now().Minute()
-
-				// Run hourly aggregation at the start of each hour
-				if minute < 5 {
-					s.aggregateCounterHistory(ctx)
-				}
-
-				// Clean up old detailed records once a day at 1:00 AM
-				if hour == 1 && minute < 5 {
-					s.cleanupOldRecords(ctx)
+				writeHistory()
+			case isLeader := <-s.leadershipChan:
+				// Leadership status changed
+				if isLeader {
+					log.Printf("Instance %s is now leader, will start writing history", s.instanceID)
+					// Write history immediately when becoming leader
+					writeHistory()
+				} else {
+					log.Printf("Instance %s is no longer leader, will stop writing history", s.instanceID)
 				}
 			}
 		}
@@ -854,17 +1114,27 @@ func (s *Server) cleanupOldRecords(ctx context.Context) {
 
 func main() {
 	server := NewServer()
-	go server.startHistoryLogger(ctx)
+
+	log.Printf("Starting counter-ws-server with instance ID: %s", server.instanceID)
+
+	// Start leader election before starting history logger
+	go server.runLeaderElection(ctx)
+
+	// These services run on all instances
+	go server.startHistoryLogger(ctx) // Will only write if instance is leader
 	go server.trackViewers(ctx)
+	go server.cleanupRateLimiters(ctx)
 
 	http.HandleFunc("/ws", server.handleWebSocket)
 	http.HandleFunc("/viewer-count", server.handleViewerCount)
+	http.HandleFunc("/health-check", server.handleHealthCheck)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	log.Printf("Server listening on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
