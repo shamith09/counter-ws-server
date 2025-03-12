@@ -189,14 +189,6 @@ func NewServer() *Server {
 				}
 			}
 
-			// Also allow by hostname pattern
-			hostname := u.Hostname()
-			if hostname == "localhost" ||
-				strings.HasSuffix(hostname, ".vercel.app") ||
-				strings.HasSuffix(hostname, ".the-counter.com") {
-				return true
-			}
-
 			log.Printf("Rejected WebSocket connection from origin: %s", origin)
 			return false
 		},
