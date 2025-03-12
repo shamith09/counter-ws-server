@@ -9,7 +9,9 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,16 +47,13 @@ func init() {
 }
 
 type Server struct {
-	clients        sync.Map
-	redisClient    *redis.Client
-	upgrader       websocket.Upgrader
-	db             *sql.DB
-	incrScript     *redis.Script
-	rateLimiter    sync.Map  // clientID -> lastIncrementTime
-	ipLimiter      sync.Map  // IP -> connectionInfo
-	instanceID     string    // Unique ID for this server instance
-	isLeader       bool      // Whether this instance is the leader
-	leadershipChan chan bool // Channel to notify of leadership changes
+	clients     sync.Map
+	redisClient *redis.Client
+	upgrader    websocket.Upgrader
+	db          *sql.DB
+	incrScript  *redis.Script
+	rateLimiter sync.Map // clientID -> lastIncrementTime
+	ipLimiter   sync.Map // IP -> connectionInfo
 }
 
 // ConnectionInfo tracks connection attempts from an IP
@@ -95,10 +94,6 @@ const (
 
 	// Send pings to peer with this period (must be less than pongWait)
 	pingPeriod = 10 * time.Second
-
-	// Counter history keys
-	counterHistoryKey = "counter_history" // Sorted set for counter history
-	historyInterval   = 1 * time.Minute   // Log counter every minute for more detailed history
 )
 
 func NewServer() *Server {
@@ -163,24 +158,58 @@ func NewServer() *Server {
 
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true
+			// Get the origin header
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// Allow requests with no origin header (like curl requests)
+				return true
+			}
+
+			// Parse the origin URL
+			u, err := url.Parse(origin)
+			if err != nil {
+				log.Printf("Error parsing origin %s: %v", origin, err)
+				return false
+			}
+
+			// Get allowed origins from environment variable
+			allowedOriginsStr := os.Getenv("ALLOWED_ORIGINS")
+			if allowedOriginsStr == "" {
+				// Default to localhost and production domains if not specified
+				allowedOriginsStr = "http://localhost:3000,https://thecounter.live"
+			}
+
+			// Split the allowed origins string into a slice
+			allowedOrigins := strings.Split(allowedOriginsStr, ",")
+
+			// Check if the origin is in the allowed list
+			for _, allowed := range allowedOrigins {
+				if strings.TrimSpace(allowed) == origin {
+					return true
+				}
+			}
+
+			// Also allow by hostname pattern
+			hostname := u.Hostname()
+			if hostname == "localhost" ||
+				strings.HasSuffix(hostname, ".vercel.app") ||
+				strings.HasSuffix(hostname, ".the-counter.com") {
+				return true
+			}
+
+			log.Printf("Rejected WebSocket connection from origin: %s", origin)
+			return false
 		},
 		HandshakeTimeout: 10 * time.Second,
 		ReadBufferSize:   1024,
 		WriteBufferSize:  1024,
 	}
 
-	// Generate a unique ID for this server instance
-	instanceID := fmt.Sprintf("server-%s", uuid.New().String())
-
 	return &Server{
-		redisClient:    redisClient,
-		upgrader:       upgrader,
-		db:             db,
-		incrScript:     incrScript,
-		instanceID:     instanceID,
-		isLeader:       false,              // Start as non-leader
-		leadershipChan: make(chan bool, 1), // Buffer of 1 to prevent blocking
+		redisClient: redisClient,
+		upgrader:    upgrader,
+		db:          db,
+		incrScript:  incrScript,
 	}
 }
 
@@ -213,7 +242,7 @@ func (s *Server) updateViewerCount(ctx context.Context) {
 // Returns true if the client is rate limited and should be blocked
 func (s *Server) isRateLimited(clientID string) bool {
 	// Rate limit: 5 increments per second per client
-	rateLimit := 5 * time.Second
+	rateLimit := 200 * time.Millisecond
 
 	// Check if client has a recent increment
 	if lastTime, exists := s.rateLimiter.Load(clientID); exists {
@@ -316,95 +345,6 @@ func (s *Server) cleanupRateLimiters(ctx context.Context) {
 	}()
 }
 
-// runLeaderElection periodically attempts to become the leader
-// Only one instance should be the leader and handle database writes
-func (s *Server) runLeaderElection(ctx context.Context) {
-	const leaderKey = "counter-leader"
-	const leaderTTL = 30 * time.Second
-
-	// Try to become leader immediately
-	s.tryBecomeLeader(leaderKey, leaderTTL)
-
-	// Then try periodically
-	ticker := time.NewTicker(10 * time.Second)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				ticker.Stop()
-				// Release leadership if we're the leader
-				isLeader := s.isLeader
-
-				if isLeader {
-					s.redisClient.Del(ctx, leaderKey)
-
-					s.isLeader = false
-
-					log.Printf("Instance %s released leadership", s.instanceID)
-
-					// Notify about leadership change
-					select {
-					case s.leadershipChan <- false: // Signal we're no longer leader
-					default: // Don't block if channel is full
-					}
-				}
-				return
-			case <-ticker.C:
-				s.tryBecomeLeader(leaderKey, leaderTTL)
-			}
-		}
-	}()
-}
-
-// tryBecomeLeader attempts to acquire leadership using Redis
-func (s *Server) tryBecomeLeader(leaderKey string, leaderTTL time.Duration) {
-	wasLeader := s.isLeader
-
-	// If we're already the leader, just refresh the TTL
-	if wasLeader {
-		success, err := s.redisClient.Expire(ctx, leaderKey, leaderTTL).Result()
-		if err != nil || !success {
-			log.Printf("Failed to refresh leader key, releasing leadership: %v", err)
-			s.isLeader = false
-
-			// Notify about leadership change
-			select {
-			case s.leadershipChan <- false: // Signal we're no longer leader
-			default: // Don't block if channel is full
-			}
-		}
-		return
-	}
-
-	// Try to acquire leadership with NX (only if key doesn't exist)
-	success, err := s.redisClient.SetNX(ctx, leaderKey, s.instanceID, leaderTTL).Result()
-	if err != nil {
-		log.Printf("Error in leader election: %v", err)
-		return
-	}
-
-	if success {
-		s.isLeader = true
-
-		log.Printf("Instance %s became the leader", s.instanceID)
-
-		// Notify about leadership change
-		select {
-		case s.leadershipChan <- true: // Signal we're now the leader
-		default: // Don't block if channel is full
-		}
-	} else {
-		// Check if the current leader is still alive
-		currentLeader, err := s.redisClient.Get(ctx, leaderKey).Result()
-		if err != nil && err != redis.Nil {
-			log.Printf("Error checking current leader: %v", err)
-			return
-		}
-
-		log.Printf("Current leader is %s, we are %s", currentLeader, s.instanceID)
-	}
-}
-
 func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
 	count := s.getViewerCount()
 
@@ -421,12 +361,10 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
-	isLeader := s.isLeader
-
 	response := map[string]interface{}{
 		"status":      "ok",
-		"instance_id": s.instanceID,
-		"is_leader":   isLeader,
+		"instance_id": "N/A", // Since leader election is removed
+		"is_leader":   false,
 		"timestamp":   time.Now().Format(time.RFC3339),
 		"connections": s.getViewerCount(),
 	}
@@ -536,15 +474,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Insert or update viewer record using direct query
-		query := fmt.Sprintf(`
+		// Insert or update viewer record using parameterized query
+		_, err := s.db.ExecContext(context.Background(), `
 			INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
-			VALUES ('%s', NOW(), '%s', '%s')
+			VALUES ($1, NOW(), $2, $3)
 			ON CONFLICT (client_id) 
-			DO UPDATE SET last_seen = NOW(), ip_address = '%s', user_agent = '%s'
+			DO UPDATE SET last_seen = NOW(), ip_address = $4, user_agent = $5
 		`, clientID, ipAddress, r.UserAgent(), ipAddress, r.UserAgent())
-
-		_, err := s.db.ExecContext(context.Background(), query)
 
 		if err != nil {
 			errorLog("Error tracking viewer in database: %v", err)
@@ -749,69 +685,67 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						go func(userID string, valueDiff *big.Int, countryCode, countryName string, operation string) {
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
-							var userQuery string
+							var err error
+
 							if _, err := uuid.Parse(userID); err == nil {
-								userQuery = fmt.Sprintf("SELECT id FROM users WHERE id = '%s'", userID)
+								err = s.db.QueryRowContext(context.Background(),
+									"SELECT id FROM users WHERE id = $1", userID).Scan(&dbUserID)
 							} else {
-								userQuery = fmt.Sprintf("SELECT id FROM users WHERE oauth_id = '%s'", userID)
+								err = s.db.QueryRowContext(context.Background(),
+									"SELECT id FROM users WHERE oauth_id = $1", userID).Scan(&dbUserID)
 							}
 
-							err := s.db.QueryRowContext(context.Background(), userQuery).Scan(&dbUserID)
 							if err != nil {
 								errorLog("Error finding user: %v", err)
 								return
 							}
 
 							// Update user_stats table with the actual UUID
-							statsQuery := fmt.Sprintf(`
+							_, err = s.db.ExecContext(context.Background(), `
 								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
-								VALUES ('%s', 1, '%s', NOW())
+								VALUES ($1, 1, $2, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
 									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + '%s',
+									total_value_added = user_stats.total_value_added + $3,
 									last_increment = NOW()
 							`, dbUserID, valueDiff.String(), valueDiff.String())
 
-							_, err = s.db.ExecContext(context.Background(), statsQuery)
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							}
 
 							// Insert user activity
-							activityQuery := fmt.Sprintf(`
+							_, err = s.db.ExecContext(context.Background(), `
 								INSERT INTO user_activity (user_id, value_diff, created_at)
-								VALUES ('%s', '%s', NOW())
+								VALUES ($1, $2, NOW())
 							`, dbUserID, valueDiff.String())
 
-							_, err = s.db.ExecContext(context.Background(), activityQuery)
 							if err != nil {
 								errorLog("Error inserting user activity: %v", err)
 							}
 
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
-								countryStatsQuery := fmt.Sprintf(`
+								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
-									VALUES ('%s', '%s', 1, NOW())
+									VALUES ($1, $2, 1, NOW())
 									ON CONFLICT (country_code)
 									DO UPDATE SET
 										increment_count = country_stats.increment_count + 1,
 										last_increment = NOW()
 								`, countryCode, countryName)
 
-								_, err = s.db.ExecContext(context.Background(), countryStatsQuery)
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
 								}
 
 								// Insert country activity
-								countryActivityQuery := fmt.Sprintf(`
+								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
-									VALUES ('%s', '%s', '%s', NOW())
+									VALUES ($1, $2, $3, NOW())
 								`, countryCode, countryName, valueDiff.String())
 
-								_, err = s.db.ExecContext(context.Background(), countryActivityQuery)
 								if err != nil {
 									errorLog("Error inserting country activity: %v", err)
 								}
@@ -841,13 +775,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				case "ping":
 					// Handle ping message - update last_seen timestamp in a goroutine
 					go func() {
-						query := fmt.Sprintf(`
+						_, err := s.db.ExecContext(context.Background(), `
 							UPDATE viewers 
 							SET last_seen = NOW() 
-							WHERE client_id = '%s'
+							WHERE client_id = $1
 						`, clientID)
-
-						_, err := s.db.ExecContext(context.Background(), query)
 
 						if err != nil {
 							errorLog("Error updating viewer timestamp: %v", err)
@@ -931,13 +863,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "ping":
 				// Handle ping message - update last_seen timestamp in a goroutine
 				go func() {
-					query := fmt.Sprintf(`
+					_, err := s.db.ExecContext(context.Background(), `
 						UPDATE viewers 
 						SET last_seen = NOW() 
-						WHERE client_id = '%s'
+						WHERE client_id = $1
 					`, clientID)
-
-					_, err := s.db.ExecContext(context.Background(), query)
 
 					if err != nil {
 						errorLog("Error updating viewer timestamp: %v", err)
@@ -950,178 +880,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) startHistoryLogger(ctx context.Context) {
-	ticker := time.NewTicker(historyInterval)
-
-	// Function to write history to database
-	writeHistory := func() {
-		isLeader := s.isLeader
-
-		// Only the leader should write history to the database
-		if !isLeader {
-			return
-		}
-
-		log.Printf("Leader %s is writing history to database", s.instanceID)
-		count, err := s.redisClient.Get(ctx, "counter").Result()
-		if err != nil && err != redis.Nil {
-			errorLog("Error getting counter for history: %v", err)
-			return
-		}
-
-		// Store in PostgreSQL counter_history table using a simple query
-		_, err = s.db.ExecContext(ctx, fmt.Sprintf(
-			"INSERT INTO counter_history (count, timestamp, granularity) VALUES ('%s', NOW(), 'detailed') ON CONFLICT (timestamp, granularity) DO UPDATE SET count = '%s'",
-			count, count))
-
-		if err != nil {
-			errorLog("Error storing counter history in PostgreSQL: %v", err)
-		}
-
-		// Periodically aggregate detailed records into hourly and daily records
-		// This is done less frequently to avoid excessive database operations
-		hour := time.Now().Hour()
-		minute := time.Now().Minute()
-
-		// Run hourly aggregation at the start of each hour
-		if minute < 5 {
-			s.aggregateCounterHistory(ctx)
-		}
-
-		// Clean up old detailed records once a day at 1:00 AM
-		if hour == 1 && minute < 5 {
-			s.cleanupOldRecords(ctx)
-		}
-	}
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				ticker.Stop()
-				return
-			case <-ticker.C:
-				writeHistory()
-			case isLeader := <-s.leadershipChan:
-				// Leadership status changed
-				if isLeader {
-					log.Printf("Instance %s is now leader, will start writing history", s.instanceID)
-					// Write history immediately when becoming leader
-					writeHistory()
-				} else {
-					log.Printf("Instance %s is no longer leader, will stop writing history", s.instanceID)
-				}
-			}
-		}
-	}()
-}
-
-func (s *Server) aggregateCounterHistory(ctx context.Context) {
-	// Aggregate detailed records into hourly records for the previous hour
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
-		SELECT 
-			(array_agg(count ORDER BY timestamp DESC))[1] as count,
-			date_trunc('hour', timestamp) as hour_timestamp,
-			'hourly' as granularity,
-			(array_agg(count ORDER BY timestamp ASC))[1] as start_count,
-			(array_agg(count ORDER BY timestamp DESC))[1] as end_count,
-			(array_agg(count ORDER BY timestamp DESC))[1] as avg_count, -- Using last count as avg since we can't average strings
-			min(count) as min_count,             -- This works for lexicographical comparison
-			max(count) as max_count              -- This works for lexicographical comparison
-		FROM counter_history
-		WHERE 
-			granularity = 'detailed' AND
-			timestamp >= date_trunc('hour', NOW() - INTERVAL '1 hour') AND
-			timestamp < date_trunc('hour', NOW())
-		GROUP BY hour_timestamp
-		ON CONFLICT (timestamp, granularity)
-		DO UPDATE SET 
-			count = EXCLUDED.count,
-			start_count = EXCLUDED.start_count,
-			end_count = EXCLUDED.end_count,
-			avg_count = EXCLUDED.avg_count,
-			min_count = EXCLUDED.min_count,
-			max_count = EXCLUDED.max_count
-	`)
-
-	if err != nil {
-		errorLog("Error aggregating hourly counter history: %v", err)
-	}
-
-	// At midnight, also aggregate the previous day's hourly records into a daily record
-	if time.Now().Hour() == 0 {
-		_, err := s.db.ExecContext(ctx, `
-			INSERT INTO counter_history (count, timestamp, granularity, start_count, end_count, avg_count, min_count, max_count)
-			SELECT 
-				(array_agg(count ORDER BY timestamp DESC))[1] as count,
-				date_trunc('day', timestamp) as day_timestamp,
-				'daily' as granularity,
-				(array_agg(count ORDER BY timestamp ASC))[1] as start_count,
-				(array_agg(count ORDER BY timestamp DESC))[1] as end_count,
-				(array_agg(count ORDER BY timestamp DESC))[1] as avg_count, -- Using last count as avg since we can't average strings
-				min(count) as min_count,             -- This works for lexicographical comparison
-				max(count) as max_count              -- This works for lexicographical comparison
-			FROM counter_history
-			WHERE 
-				granularity = 'hourly' AND
-				timestamp >= date_trunc('day', NOW() - INTERVAL '1 day') AND
-				timestamp < date_trunc('day', NOW())
-			GROUP BY day_timestamp
-			ON CONFLICT (timestamp, granularity)
-			DO UPDATE SET 
-				count = EXCLUDED.count,
-				start_count = EXCLUDED.start_count,
-				end_count = EXCLUDED.end_count,
-				avg_count = EXCLUDED.avg_count,
-				min_count = EXCLUDED.min_count,
-				max_count = EXCLUDED.max_count
-		`)
-
-		if err != nil {
-			errorLog("Error aggregating daily counter history: %v", err)
-		}
-	}
-}
-
-func (s *Server) cleanupOldRecords(ctx context.Context) {
-	// Keep detailed records for 7 days
-	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM counter_history 
-		WHERE 
-			granularity = 'detailed' AND 
-			timestamp < NOW() - INTERVAL '7 days'
-	`)
-
-	if err != nil {
-		errorLog("Error cleaning up old detailed records: %v", err)
-	}
-
-	// Keep hourly records for 90 days
-	_, err = s.db.ExecContext(ctx, `
-		DELETE FROM counter_history 
-		WHERE 
-			granularity = 'hourly' AND 
-			timestamp < NOW() - INTERVAL '90 days'
-	`)
-
-	if err != nil {
-		errorLog("Error cleaning up old hourly records: %v", err)
-	}
-
-	// Daily records are kept indefinitely for historical analysis
-}
-
 func main() {
 	server := NewServer()
 
-	log.Printf("Starting counter-ws-server with instance ID: %s", server.instanceID)
-
-	// Start leader election before starting history logger
-	go server.runLeaderElection(ctx)
+	log.Printf("Starting counter-ws-server")
 
 	// These services run on all instances
-	go server.startHistoryLogger(ctx) // Will only write if instance is leader
 	go server.trackViewers(ctx)
 	go server.cleanupRateLimiters(ctx)
 
