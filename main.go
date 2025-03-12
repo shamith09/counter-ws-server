@@ -233,8 +233,8 @@ func (s *Server) updateViewerCount(ctx context.Context) {
 // isRateLimited checks if a client is rate limited for increment operations
 // Returns true if the client is rate limited and should be blocked
 func (s *Server) isRateLimited(clientID string) bool {
-	// Rate limit: 5 increments per second per client
-	rateLimit := 200 * time.Millisecond
+	// Rate limit: 20 increments per second per client
+	rateLimit := 50 * time.Millisecond
 
 	// Check if client has a recent increment
 	if lastTime, exists := s.rateLimiter.Load(clientID); exists {
