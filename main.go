@@ -166,7 +166,7 @@ func NewServer() *Server {
 			}
 
 			// Parse the origin URL
-			u, err := url.Parse(origin)
+			_, err := url.Parse(origin)
 			if err != nil {
 				log.Printf("Error parsing origin %s: %v", origin, err)
 				return false
@@ -680,10 +680,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							var err error
 
 							if _, err := uuid.Parse(userID); err == nil {
-								err = s.db.QueryRowContext(context.Background(),
+								_ = s.db.QueryRowContext(context.Background(),
 									"SELECT id FROM users WHERE id = $1", userID).Scan(&dbUserID)
 							} else {
-								err = s.db.QueryRowContext(context.Background(),
+								_ = s.db.QueryRowContext(context.Background(),
 									"SELECT id FROM users WHERE oauth_id = $1", userID).Scan(&dbUserID)
 							}
 
