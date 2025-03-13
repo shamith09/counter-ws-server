@@ -652,10 +652,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						// Calculate the difference
 						valueDiff = new(big.Int).Sub(result, currentBig)
 
-						// Log the multiplication details
-						log.Printf("Multiplication: %s × %d = %s (adding %s to user stats)",
-							currentBig.String(), multiplyAmount, result.String(), valueDiff.String())
-
 						// Store the result
 						newCount = result.String()
 						if err := s.redisClient.Set(ctx, "counter", newCount, 0).Err(); err != nil {
@@ -679,12 +675,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					// Update stats in background
 					if msg.UserID != "" {
 						go func(userID string, valueDiff *big.Int, countryCode, countryName string, operation string) {
-							// Log the incoming user ID for debugging
-							log.Printf("Processing increment attribution for userID: %s", userID)
-
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
-							var lookupErr error
+							var err error
 
 							if _, err := uuid.Parse(userID); err == nil {
 								// It's a valid UUID format, try direct lookup
@@ -712,9 +705,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							log.Printf("Successfully found user with DB ID: %s for userID: %s", dbUserID.String(), userID)
 
+							// Create a transaction to ensure all updates are atomic
+							tx, txErr := s.db.BeginTx(context.Background(), nil)
+							if txErr != nil {
+								errorLog("Failed to begin transaction: %v", txErr)
+								return
+							}
+							defer tx.Rollback() // Will be ignored if tx.Commit() is called
+
 							// Update user_stats table with the actual UUID
 							log.Printf("Updating user_stats for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
-							_, err = s.db.ExecContext(context.Background(), `
+							_, err = tx.ExecContext(context.Background(), `
 								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
 								VALUES ($1, 1, $2, NOW())
 								ON CONFLICT (user_id)
@@ -726,6 +727,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
+								return
 							} else {
 								// Log operation type and value added
 								if operation == "multiply" {
@@ -739,19 +741,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							// Insert user activity
 							log.Printf("Inserting user_activity for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
-							_, err = s.db.ExecContext(context.Background(), `
+							_, err = tx.ExecContext(context.Background(), `
 								INSERT INTO user_activity (user_id, value_diff, created_at)
 								VALUES ($1, $2, NOW())
 							`, dbUserID, valueDiff.String())
 
 							if err != nil {
 								errorLog("Error inserting user activity: %v", err)
+								return
 							}
 
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
 								log.Printf("Updating country_stats for country %s (%s)", countryName, countryCode)
-								_, err = s.db.ExecContext(context.Background(), `
+								_, err = tx.ExecContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
 									VALUES ($1, $2, 1, NOW())
 									ON CONFLICT (country_code)
@@ -763,20 +766,28 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
+									return
 								}
 
 								// Insert country activity
 								log.Printf("Inserting country_activity for country %s (%s) with value_diff %s", countryName, countryCode, valueDiff.String())
-								_, err = s.db.ExecContext(context.Background(), `
+								_, err = tx.ExecContext(context.Background(), `
 									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
 									VALUES ($1, $2, $3, NOW())
 								`, countryCode, countryName, valueDiff.String())
 
 								if err != nil {
 									errorLog("Error inserting country activity: %v", err)
+									return
 								} else {
 									log.Printf("Successfully updated country stats for %s, added value: %s", countryName, valueDiff.String())
 								}
+							}
+
+							// Commit the transaction
+							if err = tx.Commit(); err != nil {
+								errorLog("Failed to commit transaction: %v", err)
+								return
 							}
 						}(msg.UserID, valueDiff, msg.CountryCode, msg.CountryName, msg.Operation)
 					}
