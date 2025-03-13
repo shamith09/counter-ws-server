@@ -216,9 +216,6 @@ func (s *Server) incrementCounter(ctx context.Context, amount string) (string, e
 		return "", fmt.Errorf("failed to execute increment script: %v", err)
 	}
 
-	// Record counter history in the background
-	go s.recordCounterHistory(ctx, result.(string))
-
 	return result.(string), nil
 }
 
@@ -1083,27 +1080,6 @@ func (s *Server) cleanupStaleViewers() {
 
 	// Log the instance ID
 	log.Printf("Server instance ID: %s", s.instanceID)
-}
-
-// Record counter history
-func (s *Server) recordCounterHistory(ctx context.Context, value string) {
-	// Prepare statement for counter history
-	stmt, err := s.db.PrepareContext(ctx, `
-		INSERT INTO counter_history (count, timestamp, granularity)
-		VALUES ($1, NOW(), 'detailed')
-	`)
-	if err != nil {
-		errorLog("Error preparing counter history statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	// Execute the prepared statement
-	_, err = stmt.ExecContext(ctx, value)
-
-	if err != nil {
-		errorLog("Error recording counter history: %v", err)
-	}
 }
 
 func main() {
