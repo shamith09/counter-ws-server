@@ -1089,8 +1089,8 @@ func (s *Server) cleanupStaleViewers() {
 func (s *Server) recordCounterHistory(ctx context.Context, value string) {
 	// Prepare statement for counter history
 	stmt, err := s.db.PrepareContext(ctx, `
-		INSERT INTO counter_history (value, created_at)
-		VALUES ($1, NOW())
+		INSERT INTO counter_history (count, timestamp, granularity)
+		VALUES ($1, NOW(), 'detailed')
 	`)
 	if err != nil {
 		errorLog("Error preparing counter history statement: %v", err)
