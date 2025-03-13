@@ -211,18 +211,34 @@ func (s *Server) incrementCounter(ctx context.Context, amount string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("failed to execute increment script: %v", err)
 	}
+
+	// Record counter history in the background
+	go s.recordCounterHistory(ctx, result.(string))
+
 	return result.(string), nil
 }
 
 func (s *Server) getViewerCount() int {
-	// Count active viewers from the database
 	var count int
-	err := s.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`).Scan(&count)
+
+	// Prepare statement for viewer count
+	stmt, err := s.db.PrepareContext(context.Background(),
+		`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`)
+	if err != nil {
+		errorLog("Error preparing viewer count statement: %v", err)
+		inMemoryCount := 0
+		s.clients.Range(func(_, _ interface{}) bool {
+			inMemoryCount++
+			return true
+		})
+		return inMemoryCount
+	}
+	defer stmt.Close()
+
+	err = stmt.QueryRowContext(context.Background()).Scan(&count)
 
 	if err != nil {
 		errorLog("Error getting viewer count from database: %v", err)
-		// Fallback to in-memory count if database query fails
 		inMemoryCount := 0
 		s.clients.Range(func(_, _ interface{}) bool {
 			inMemoryCount++
@@ -236,8 +252,32 @@ func (s *Server) getViewerCount() int {
 
 func (s *Server) updateViewerCount(ctx context.Context) {
 	count := s.getViewerCount()
-	if err := s.redisClient.Set(ctx, "viewer_count", count, 0).Err(); err != nil {
+
+	// Prepare statement for cleanup
+	cleanupStmt, err := s.db.PrepareContext(ctx,
+		`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '30 seconds'`)
+	if err != nil {
+		errorLog("Error preparing cleanup statement: %v", err)
+		return
+	}
+	defer cleanupStmt.Close()
+
+	result, err := cleanupStmt.ExecContext(ctx)
+	if err != nil {
+		errorLog("Error cleaning up stale viewers: %v", err)
+	} else {
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected > 0 {
+			log.Printf("Cleaned up %d stale viewer records", rowsAffected)
+		}
+	}
+
+	// Update Redis with current count
+	err = s.redisClient.Set(ctx, "viewer_count", count, 0).Err()
+	if err != nil {
 		errorLog("Error updating viewer count in Redis: %v", err)
+	} else {
+		log.Printf("Updated viewer count in Redis: %d", count)
 	}
 }
 
@@ -423,7 +463,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	clientID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
+	// Generate a unique client ID
+	clientID := uuid.New().String()
 	messages := make(chan Message, 100)
 	errors := make(chan error, 10)
 	done := make(chan struct{})
@@ -442,11 +483,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		// Remove this viewer from the database immediately and update viewer count in a goroutine
 		go func() {
-			_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`DELETE FROM viewers WHERE client_id = '%s'`, clientID))
-			if err != nil {
-				errorLog("Error removing viewer from database: %v", err)
-			}
-
+			s.removeViewer(context.Background(), clientID)
 			// Update viewer count after client disconnects
 			s.updateViewerCount(context.Background())
 		}()
@@ -479,32 +516,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Track this viewer in the database in a goroutine
 	go func() {
-		ipAddress := r.Header.Get("X-Forwarded-For")
-		if ipAddress == "" {
-			// Extract just the IP part from RemoteAddr (remove port if present)
-			ipAddress = r.RemoteAddr
-			if host, _, err := net.SplitHostPort(ipAddress); err == nil {
-				ipAddress = host
-			}
-		}
-
-		// Insert or update viewer record using simple query to avoid prepared statement issues
-		_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
-			INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
-			VALUES ('%s', NOW(), '%s', '%s')
-			ON CONFLICT (client_id) 
-			DO UPDATE SET last_seen = NOW(), ip_address = '%s', user_agent = '%s'
-		`,
-			clientID,
-			strings.Replace(ipAddress, "'", "''", -1),
-			strings.Replace(r.UserAgent(), "'", "''", -1),
-			strings.Replace(ipAddress, "'", "''", -1),
-			strings.Replace(r.UserAgent(), "'", "''", -1)))
-
-		if err != nil {
-			errorLog("Error tracking viewer in database: %v", err)
-		}
-
+		s.trackViewer(context.Background(), clientID, ipAddress, r.UserAgent())
 		// Update viewer count after a new client connects
 		s.updateViewerCount(context.Background())
 	}()
@@ -711,65 +723,107 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
-							var lookupErr error
+							var email string
+							var username string
 
-							if _, err := uuid.Parse(userID); err == nil {
-								// It's a valid UUID format, try direct lookup
-								lookupErr = s.db.QueryRowContext(context.Background(),
-									"SELECT id FROM users WHERE id = $1", userID).Scan(&dbUserID)
-								if lookupErr != nil {
-									errorLog("Error finding user by ID: %v, userID: %s", lookupErr, userID)
-								}
-							} else {
-								// Try lookup by oauth_id
-								lookupErr = s.db.QueryRowContext(context.Background(),
-									"SELECT id FROM users WHERE oauth_provider = 'google' AND oauth_id = $1", userID).Scan(&dbUserID)
+							// Prepare statement for user lookup
+							stmt, err := s.db.PrepareContext(context.Background(), `
+								SELECT id, email, username FROM users WHERE oauth_id = $1
+							`)
+							if err != nil {
+								errorLog("Error preparing user lookup statement: %v", err)
+								return
+							}
+							defer stmt.Close()
 
-								// If that fails, try by email as fallback
-								if lookupErr != nil {
-									lookupErr = s.db.QueryRowContext(context.Background(),
-										"SELECT id FROM users WHERE email = $1", userID).Scan(&dbUserID)
+							// Try to look up user by oauth_id for Google users
+							err = stmt.QueryRowContext(context.Background(), userID).Scan(&dbUserID, &email, &username)
+
+							// If that fails, check if userID is a valid UUID and try to look it up directly
+							if err != nil {
+								if parsedUUID, err := uuid.Parse(userID); err == nil {
+									// Prepare statement for direct UUID lookup
+									directStmt, err := s.db.PrepareContext(context.Background(), `
+										SELECT id, email, username FROM users WHERE id = $1
+									`)
+									if err != nil {
+										errorLog("Error preparing direct UUID lookup statement: %v", err)
+										return
+									}
+									defer directStmt.Close()
+
+									err = directStmt.QueryRowContext(context.Background(), parsedUUID).Scan(&dbUserID, &email, &username)
 								}
 							}
 
-							if lookupErr != nil {
-								errorLog("Failed to find user in database: %v, userID: %s", lookupErr, userID)
+							// If both lookups fail, try to find user by email as fallback
+							if err != nil {
+								// Check if userID looks like an email
+								if strings.Contains(userID, "@") {
+									// Prepare statement for email lookup
+									emailStmt, err := s.db.PrepareContext(context.Background(), `
+										SELECT id, email, username FROM users WHERE email = $1
+									`)
+									if err != nil {
+										errorLog("Error preparing email lookup statement: %v", err)
+										return
+									}
+									defer emailStmt.Close()
+
+									err = emailStmt.QueryRowContext(context.Background(), userID).Scan(&dbUserID, &email, &username)
+								}
+							}
+
+							if err != nil {
+								errorLog("Failed to find user in database: %v, userID: %s", err, userID)
 								return
 							}
 
 							log.Printf("Successfully found user with DB ID: %s for userID: %s", dbUserID.String(), userID)
 
-							// Update user_stats table with the actual UUID
+							// Update user stats
 							log.Printf("Updating user_stats for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
-							_, err = s.db.ExecContext(context.Background(), `
-								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
-								VALUES ($1, 1, $2, NOW())
+
+							// Prepare statement for user stats
+							userStatsStmt, err := s.db.PrepareContext(context.Background(), `
+								INSERT INTO user_stats (user_id, username, increment_count, total_value_added, last_increment)
+								VALUES ($1, $2, 1, $3, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
 									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + $2,
-									last_increment = NOW()
-							`, dbUserID, valueDiff.String())
+									total_value_added = user_stats.total_value_added + $3::numeric,
+									last_increment = NOW(),
+									username = $2
+							`)
+							if err != nil {
+								errorLog("Error preparing user stats statement: %v", err)
+								return
+							}
+							defer userStatsStmt.Close()
+
+							_, err = userStatsStmt.ExecContext(context.Background(), dbUserID, username, valueDiff.String())
 
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							} else {
-								// Log operation type and value added
-								if operation == "multiply" {
-									log.Printf("Successfully attributed multiplication to user %s, added value: %s",
-										dbUserID.String(), valueDiff.String())
-								} else {
-									log.Printf("Successfully attributed increment to user %s, added value: %s",
-										dbUserID.String(), valueDiff.String())
-								}
+								log.Printf("Successfully updated user stats for %s, added value: %s", username, valueDiff.String())
 							}
 
 							// Insert user activity
 							log.Printf("Inserting user_activity for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
-							_, err = s.db.ExecContext(context.Background(), `
+
+							// Prepare statement for user activity
+							activityStmt, err := s.db.PrepareContext(context.Background(), `
 								INSERT INTO user_activity (user_id, value_diff, created_at)
 								VALUES ($1, $2, NOW())
-							`, dbUserID, valueDiff.String())
+							`)
+							if err != nil {
+								errorLog("Error preparing user activity statement: %v", err)
+								return
+							}
+							defer activityStmt.Close()
+
+							_, err = activityStmt.ExecContext(context.Background(), dbUserID, valueDiff.String())
 
 							if err != nil {
 								errorLog("Error inserting user activity: %v", err)
@@ -778,7 +832,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
 								log.Printf("Updating country_stats for country %s (%s)", countryName, countryCode)
-								_, err = s.db.ExecContext(context.Background(), `
+
+								// Prepare statement for country stats
+								countryStmt, err := s.db.PrepareContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
 									VALUES ($1, $2, 1, NOW())
 									ON CONFLICT (country_code)
@@ -786,7 +842,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 										increment_count = country_stats.increment_count + 1,
 										last_increment = NOW(),
 										country_name = $2
-								`, countryCode, countryName)
+								`)
+								if err != nil {
+									errorLog("Error preparing country stats statement: %v", err)
+									return
+								}
+								defer countryStmt.Close()
+
+								_, err = countryStmt.ExecContext(context.Background(), countryCode, countryName)
 
 								if err != nil {
 									errorLog("Error updating country stats: %v", err)
@@ -794,10 +857,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 								// Insert country activity
 								log.Printf("Inserting country_activity for country %s (%s) with value_diff %s", countryName, countryCode, valueDiff.String())
-								_, err = s.db.ExecContext(context.Background(), `
+
+								// Prepare statement for country activity
+								countryActivityStmt, err := s.db.PrepareContext(context.Background(), `
 									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
 									VALUES ($1, $2, $3, NOW())
-								`, countryCode, countryName, valueDiff.String())
+								`)
+								if err != nil {
+									errorLog("Error preparing country activity statement: %v", err)
+									return
+								}
+								defer countryActivityStmt.Close()
+
+								_, err = countryActivityStmt.ExecContext(context.Background(), countryCode, countryName, valueDiff.String())
 
 								if err != nil {
 									errorLog("Error inserting country activity: %v", err)
@@ -828,17 +900,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						errorLog("Error publishing count: %v", err)
 					}
 				case "ping":
-					// Handle ping message - update last_seen timestamp in a goroutine
+					// Update the viewer's last_seen timestamp in a goroutine
 					go func() {
-						_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
-							UPDATE viewers 
-							SET last_seen = NOW() 
-							WHERE client_id = '%s'
-						`, clientID))
-
-						if err != nil {
-							errorLog("Error updating viewer timestamp: %v", err)
-						}
+						s.updateViewerTimestamp(context.Background(), clientID)
 					}()
 
 					// No response needed for ping
@@ -918,15 +982,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "ping":
 				// Handle ping message - update last_seen timestamp in a goroutine
 				go func() {
-					_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
-						UPDATE viewers 
-						SET last_seen = NOW() 
-						WHERE client_id = '%s'
-					`, clientID))
-
-					if err != nil {
-						errorLog("Error updating viewer timestamp: %v", err)
-					}
+					s.updateViewerTimestamp(context.Background(), clientID)
 				}()
 
 				// No response needed for ping
@@ -935,21 +991,123 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Track viewer in database
+func (s *Server) trackViewer(ctx context.Context, clientID, ipAddress, userAgent string) {
+	// Prepare statement for tracking viewer
+	stmt, err := s.db.PrepareContext(ctx, `
+		INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
+		VALUES ($1, NOW(), $2, $3)
+		ON CONFLICT (client_id) 
+		DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
+	`)
+	if err != nil {
+		errorLog("Error preparing viewer tracking statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	// Execute the prepared statement
+	_, err = stmt.ExecContext(ctx,
+		clientID,
+		ipAddress,
+		userAgent)
+
+	if err != nil {
+		errorLog("Error tracking viewer in database: %v", err)
+	}
+}
+
+// Update viewer timestamp
+func (s *Server) updateViewerTimestamp(ctx context.Context, clientID string) {
+	// Prepare statement for updating timestamp
+	stmt, err := s.db.PrepareContext(ctx, `
+		UPDATE viewers 
+		SET last_seen = NOW() 
+		WHERE client_id = $1
+	`)
+	if err != nil {
+		errorLog("Error preparing viewer timestamp update statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	// Execute the prepared statement
+	_, err = stmt.ExecContext(ctx, clientID)
+
+	if err != nil {
+		errorLog("Error updating viewer timestamp: %v", err)
+	}
+}
+
+// Remove viewer from database
+func (s *Server) removeViewer(ctx context.Context, clientID string) {
+	// Prepare statement for removing viewer
+	stmt, err := s.db.PrepareContext(ctx, `
+		DELETE FROM viewers 
+		WHERE client_id = $1
+	`)
+	if err != nil {
+		errorLog("Error preparing viewer removal statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	// Execute the prepared statement
+	_, err = stmt.ExecContext(ctx, clientID)
+
+	if err != nil {
+		errorLog("Error removing viewer from database: %v", err)
+	}
+}
+
+// Clean up stale viewers on startup
+func (s *Server) cleanupStaleViewers() {
+	// Prepare statement for cleanup
+	stmt, err := s.db.PrepareContext(context.Background(),
+		`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '1 minute'`)
+	if err != nil {
+		errorLog("Error preparing startup cleanup statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	result, err := stmt.ExecContext(context.Background())
+
+	if err != nil {
+		errorLog("Error cleaning up stale viewers on startup: %v", err)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("Startup cleanup: Removed %d stale viewer records", rowsAffected)
+}
+
+// Record counter history
+func (s *Server) recordCounterHistory(ctx context.Context, value string) {
+	// Prepare statement for counter history
+	stmt, err := s.db.PrepareContext(ctx, `
+		INSERT INTO counter_history (value, created_at)
+		VALUES ($1, NOW())
+	`)
+	if err != nil {
+		errorLog("Error preparing counter history statement: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	// Execute the prepared statement
+	_, err = stmt.ExecContext(ctx, value)
+
+	if err != nil {
+		errorLog("Error recording counter history: %v", err)
+	}
+}
+
 func main() {
 	server := NewServer()
 
-	log.Printf("Starting counter-ws-server")
-
 	// Clean up stale viewers on startup
-	result, err := server.db.ExecContext(context.Background(),
-		`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '1 minute'`)
-	if err != nil {
-		errorLog("Error cleaning up stale viewers on startup: %v", err)
-	} else {
-		if rowsAffected, err := result.RowsAffected(); err == nil {
-			log.Printf("Cleaned up %d stale viewer records on startup", rowsAffected)
-		}
-	}
+	server.cleanupStaleViewers()
 
 	// These services run on all instances
 	go server.trackViewers(ctx)
