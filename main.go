@@ -25,10 +25,54 @@ import (
 )
 
 var ctx = context.Background()
+var logChan = make(chan string, 1000) // Buffered channel for async logging
 
 // errorLog always logs errors
 func errorLog(format string, v ...interface{}) {
-	log.Printf("ERROR: "+format, v...)
+	msg := fmt.Sprintf("ERROR: "+format, v...)
+	select {
+	case logChan <- msg:
+		// Message queued for logging
+	default:
+		// Channel full, log directly to avoid blocking
+		log.Print(msg)
+	}
+}
+
+// infoLog for important info messages
+func infoLog(format string, v ...interface{}) {
+	select {
+	case logChan <- fmt.Sprintf(format, v...):
+		// Message queued for logging
+	default:
+		// Channel full, drop the message
+	}
+}
+
+// debugLog for verbose debug messages (disabled in production)
+func debugLog(format string, v ...interface{}) {
+	if os.Getenv("DEBUG") == "true" {
+		select {
+		case logChan <- fmt.Sprintf("DEBUG: "+format, v...):
+			// Message queued for logging
+		default:
+			// Channel full, drop the message
+		}
+	}
+}
+
+// startLogProcessor processes logs asynchronously
+func startLogProcessor(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-logChan:
+				log.Print(msg)
+			}
+		}
+	}()
 }
 
 func init() {
@@ -46,6 +90,9 @@ func init() {
 			log.Printf("Error loading .env: %v", err)
 		}
 	}
+
+	// Start the log processor
+	startLogProcessor(ctx)
 }
 
 type Server struct {
@@ -269,11 +316,11 @@ func (s *Server) updateViewerCount(ctx context.Context) {
 	} else {
 		rowsAffected, _ := result.RowsAffected()
 		if rowsAffected > 0 {
-			log.Printf("Cleaned up %d stale viewer records for instance %s", rowsAffected, s.instanceID)
+			debugLog("Cleaned up %d stale viewer records for instance %s", rowsAffected, s.instanceID)
 		}
 	}
 
-	log.Printf("Current viewer count across all instances: %d", count)
+	debugLog("Current viewer count across all instances: %d", count)
 }
 
 // isRateLimited checks if a client is rate limited for increment operations
@@ -336,27 +383,30 @@ func (s *Server) trackViewers(ctx context.Context) {
 				// Update viewer count and clean up old records
 				s.updateViewerCount(ctx)
 
-				// Log current viewer count for this instance
-				var instanceCount int
-				instanceStmt, err := s.db.PrepareContext(ctx,
-					`SELECT COUNT(*) FROM viewers WHERE server_instance_id = $1 AND last_seen > NOW() - INTERVAL '30 seconds'`)
-				if err != nil {
-					errorLog("Error preparing instance count statement: %v", err)
-				} else {
-					defer instanceStmt.Close()
-					err = instanceStmt.QueryRowContext(ctx, s.instanceID).Scan(&instanceCount)
+				// Only log in debug mode
+				if os.Getenv("DEBUG") == "true" {
+					// Log current viewer count for this instance
+					var instanceCount int
+					instanceStmt, err := s.db.PrepareContext(ctx,
+						`SELECT COUNT(*) FROM viewers WHERE server_instance_id = $1 AND last_seen > NOW() - INTERVAL '30 seconds'`)
 					if err != nil {
-						errorLog("Error getting instance viewer count: %v", err)
+						errorLog("Error preparing instance count statement: %v", err)
 					} else {
-						log.Printf("Current active viewers for instance %s: %d", s.instanceID, instanceCount)
+						defer instanceStmt.Close()
+						err = instanceStmt.QueryRowContext(ctx, s.instanceID).Scan(&instanceCount)
+						if err != nil {
+							errorLog("Error getting instance viewer count: %v", err)
+						} else {
+							debugLog("Current active viewers for instance %s: %d", s.instanceID, instanceCount)
+						}
 					}
-				}
 
-				// Log total active viewers
-				var totalCount int
-				if err := s.db.QueryRowContext(ctx,
-					`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`).Scan(&totalCount); err == nil {
-					log.Printf("Total active viewers across all instances: %d", totalCount)
+					// Log total active viewers
+					var totalCount int
+					if err := s.db.QueryRowContext(ctx,
+						`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`).Scan(&totalCount); err == nil {
+						debugLog("Total active viewers across all instances: %d", totalCount)
+					}
 				}
 			}
 		}
@@ -1076,10 +1126,10 @@ func (s *Server) cleanupStaleViewers() {
 	}
 
 	rowsAffected, _ := result.RowsAffected()
-	log.Printf("Startup cleanup: Removed %d stale viewer records", rowsAffected)
+	infoLog("Startup cleanup: Removed %d stale viewer records", rowsAffected)
 
 	// Log the instance ID
-	log.Printf("Server instance ID: %s", s.instanceID)
+	infoLog("Server instance ID: %s", s.instanceID)
 }
 
 func main() {
@@ -1098,7 +1148,7 @@ func main() {
 
 	go func() {
 		<-stop
-		log.Println("Shutting down server...")
+		infoLog("Shutting down server...")
 
 		// Clean up all viewers for this server instance
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1114,7 +1164,7 @@ func main() {
 			if err != nil {
 				errorLog("Error cleaning up viewers on shutdown: %v", err)
 			} else if rowsAffected, err := result.RowsAffected(); err == nil {
-				log.Printf("Shutdown cleanup: Removed %d viewer records for instance %s", rowsAffected, server.instanceID)
+				infoLog("Shutdown cleanup: Removed %d viewer records for instance %s", rowsAffected, server.instanceID)
 			}
 		}
 
@@ -1130,7 +1180,7 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("Server listening on port %s", port)
+	infoLog("Server listening on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
