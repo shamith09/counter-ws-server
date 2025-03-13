@@ -442,7 +442,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		// Remove this viewer from the database immediately and update viewer count in a goroutine
 		go func() {
-			_, err := s.db.ExecContext(context.Background(), `DELETE FROM viewers WHERE client_id = $1`, clientID)
+			_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`DELETE FROM viewers WHERE client_id = '%s'`, clientID))
 			if err != nil {
 				errorLog("Error removing viewer from database: %v", err)
 			}
@@ -488,13 +488,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Insert or update viewer record using parameterized query
-		_, err := s.db.ExecContext(context.Background(), `
+		// Insert or update viewer record using simple query to avoid prepared statement issues
+		_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
 			INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
-			VALUES ($1, NOW(), $2, $3)
+			VALUES ('%s', NOW(), '%s', '%s')
 			ON CONFLICT (client_id) 
-			DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
-		`, clientID, ipAddress, r.UserAgent())
+			DO UPDATE SET last_seen = NOW(), ip_address = '%s', user_agent = '%s'
+		`,
+			clientID,
+			strings.Replace(ipAddress, "'", "''", -1),
+			strings.Replace(r.UserAgent(), "'", "''", -1),
+			strings.Replace(ipAddress, "'", "''", -1),
+			strings.Replace(r.UserAgent(), "'", "''", -1)))
 
 		if err != nil {
 			errorLog("Error tracking viewer in database: %v", err)
@@ -825,11 +830,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				case "ping":
 					// Handle ping message - update last_seen timestamp in a goroutine
 					go func() {
-						_, err := s.db.ExecContext(context.Background(), `
+						_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
 							UPDATE viewers 
 							SET last_seen = NOW() 
-							WHERE client_id = $1
-						`, clientID)
+							WHERE client_id = '%s'
+						`, clientID))
 
 						if err != nil {
 							errorLog("Error updating viewer timestamp: %v", err)
@@ -913,11 +918,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "ping":
 				// Handle ping message - update last_seen timestamp in a goroutine
 				go func() {
-					_, err := s.db.ExecContext(context.Background(), `
+					_, err := s.db.ExecContext(context.Background(), fmt.Sprintf(`
 						UPDATE viewers 
 						SET last_seen = NOW() 
-						WHERE client_id = $1
-					`, clientID)
+						WHERE client_id = '%s'
+					`, clientID))
 
 					if err != nil {
 						errorLog("Error updating viewer timestamp: %v", err)
