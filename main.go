@@ -215,11 +215,22 @@ func (s *Server) incrementCounter(ctx context.Context, amount string) (string, e
 }
 
 func (s *Server) getViewerCount() int {
-	count := 0
-	s.clients.Range(func(_, _ interface{}) bool {
-		count++
-		return true
-	})
+	// Count active viewers from the database
+	var count int
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`).Scan(&count)
+
+	if err != nil {
+		errorLog("Error getting viewer count from database: %v", err)
+		// Fallback to in-memory count if database query fails
+		inMemoryCount := 0
+		s.clients.Range(func(_, _ interface{}) bool {
+			inMemoryCount++
+			return true
+		})
+		return inMemoryCount
+	}
+
 	return count
 }
 
@@ -291,10 +302,21 @@ func (s *Server) trackViewers(ctx context.Context) {
 				s.updateViewerCount(ctx)
 
 				// Clean up old records from viewers table
-				_, err := s.db.ExecContext(ctx,
-					`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '10 seconds'`)
+				result, err := s.db.ExecContext(ctx,
+					`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '30 seconds'`)
 				if err != nil {
 					errorLog("Error cleaning up old viewer records: %v", err)
+				} else {
+					if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected > 0 {
+						log.Printf("Cleaned up %d stale viewer records", rowsAffected)
+					}
+				}
+
+				// Log current viewer count
+				var count int
+				if err := s.db.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM viewers`).Scan(&count); err == nil {
+					log.Printf("Current active viewers in database: %d", count)
 				}
 			}
 		}
@@ -912,6 +934,17 @@ func main() {
 	server := NewServer()
 
 	log.Printf("Starting counter-ws-server")
+
+	// Clean up stale viewers on startup
+	result, err := server.db.ExecContext(context.Background(),
+		`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '1 minute'`)
+	if err != nil {
+		errorLog("Error cleaning up stale viewers on startup: %v", err)
+	} else {
+		if rowsAffected, err := result.RowsAffected(); err == nil {
+			log.Printf("Cleaned up %d stale viewer records on startup", rowsAffected)
+		}
+	}
 
 	// These services run on all instances
 	go server.trackViewers(ctx)
