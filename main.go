@@ -713,15 +713,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							log.Printf("Successfully found user with DB ID: %s for userID: %s", dbUserID.String(), userID)
 
 							// Update user_stats table with the actual UUID
+							log.Printf("Updating user_stats for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
 							_, err = s.db.ExecContext(context.Background(), `
 								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
 								VALUES ($1, 1, $2, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
 									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + $3,
+									total_value_added = user_stats.total_value_added + $2,
 									last_increment = NOW()
-							`, dbUserID, valueDiff.String(), valueDiff.String())
+							`, dbUserID, valueDiff.String())
 
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
@@ -737,6 +738,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							}
 
 							// Insert user activity
+							log.Printf("Inserting user_activity for user %s with value_diff %s", dbUserID.String(), valueDiff.String())
 							_, err = s.db.ExecContext(context.Background(), `
 								INSERT INTO user_activity (user_id, value_diff, created_at)
 								VALUES ($1, $2, NOW())
@@ -748,13 +750,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							// Update country stats if country info is provided
 							if countryCode != "" && countryName != "" {
+								log.Printf("Updating country_stats for country %s (%s)", countryName, countryCode)
 								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_stats (country_code, country_name, increment_count, last_increment)
 									VALUES ($1, $2, 1, NOW())
 									ON CONFLICT (country_code)
 									DO UPDATE SET
 										increment_count = country_stats.increment_count + 1,
-										last_increment = NOW()
+										last_increment = NOW(),
+										country_name = $2
 								`, countryCode, countryName)
 
 								if err != nil {
@@ -762,6 +766,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 								}
 
 								// Insert country activity
+								log.Printf("Inserting country_activity for country %s (%s) with value_diff %s", countryName, countryCode, valueDiff.String())
 								_, err = s.db.ExecContext(context.Background(), `
 									INSERT INTO country_activity (country_code, country_name, value_diff, created_at)
 									VALUES ($1, $2, $3, NOW())
