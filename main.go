@@ -22,6 +22,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/stripe/stripe-go/v72"
+	"github.com/stripe/stripe-go/v72/paymentintent"
 )
 
 var ctx = context.Background()
@@ -113,14 +115,15 @@ type ConnectionInfo struct {
 }
 
 type Message struct {
-	Type           string `json:"type"`
-	Count          string `json:"count"`
-	Operation      string `json:"operation"`
-	MultiplyAmount int    `json:"multiply_amount,omitempty"`
-	UserID         string `json:"user_id,omitempty"`
-	Amount         string `json:"amount,omitempty"`
-	CountryCode    string `json:"country_code,omitempty"`
-	CountryName    string `json:"country_name,omitempty"`
+	Type            string `json:"type"`
+	Count           string `json:"count"`
+	Operation       string `json:"operation"`
+	MultiplyAmount  int    `json:"multiply_amount,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
+	Amount          string `json:"amount,omitempty"`
+	CountryCode     string `json:"country_code,omitempty"`
+	CountryName     string `json:"country_name,omitempty"`
+	PaymentIntentID string `json:"payment_intent_id,omitempty"`
 }
 
 type CounterMessage struct {
@@ -204,6 +207,14 @@ func NewServer() *Server {
 
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping database: %v", err)
+	}
+
+	// Initialize Stripe
+	stripeKey := os.Getenv("STRIPE_SECRET_KEY")
+	if stripeKey == "" {
+		log.Println("Warning: STRIPE_SECRET_KEY not set, payment verification will be disabled")
+	} else {
+		stripe.Key = stripeKey
 	}
 
 	upgrader := websocket.Upgrader{
@@ -722,14 +733,42 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					if msg.Operation == "multiply" {
 						// Skip multiplication if amount is less than 1
 						if msg.MultiplyAmount < 1 {
+							errorLog("Invalid multiplication amount: %d", msg.MultiplyAmount)
+							if err := conn.WriteJSON(Message{
+								Type:  "error",
+								Count: "Invalid multiplication amount",
+							}); err != nil {
+								errorLog("Error sending error message: %v", err)
+							}
 							continue
 						}
 
-						// If no multiply amount specified, default to 2
-						multiplyAmount := 2
-						if msg.MultiplyAmount > 0 {
-							multiplyAmount = msg.MultiplyAmount
+						// Verify payment for multiplication
+						if msg.PaymentIntentID == "" {
+							errorLog("Missing payment intent ID for multiplication")
+							if err := conn.WriteJSON(Message{
+								Type:  "error",
+								Count: "Payment verification failed: missing payment intent ID",
+							}); err != nil {
+								errorLog("Error sending error message: %v", err)
+							}
+							continue
 						}
+
+						// Verify the payment with Stripe
+						valid, err := s.verifyPayment(ctx, msg.PaymentIntentID, msg.MultiplyAmount)
+						if !valid || err != nil {
+							errorLog("Payment verification failed: %v", err)
+							if err := conn.WriteJSON(Message{
+								Type:  "error",
+								Count: fmt.Sprintf("Payment verification failed: %v", err),
+							}); err != nil {
+								errorLog("Error sending error message: %v", err)
+							}
+							continue
+						}
+
+						multiplyAmount := msg.MultiplyAmount
 
 						// Calculate new value
 						multiplier := new(big.Int).SetInt64(int64(multiplyAmount))
@@ -739,8 +778,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						valueDiff = new(big.Int).Sub(result, currentBig)
 
 						// Log the multiplication details
-						log.Printf("Multiplication: %s × %d = %s (adding %s to user stats)",
-							currentBig.String(), multiplyAmount, result.String(), valueDiff.String())
+						log.Printf("Multiplication: %s × %d = %s (adding %s to user stats) - Payment: %s",
+							currentBig.String(), multiplyAmount, result.String(), valueDiff.String(), msg.PaymentIntentID)
 
 						// Store the result
 						newCount = result.String()
@@ -1130,6 +1169,59 @@ func (s *Server) cleanupStaleViewers() {
 
 	// Log the instance ID
 	infoLog("Server instance ID: %s", s.instanceID)
+}
+
+// verifyPayment checks if a payment is valid and hasn't been used before
+func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expectedAmount int) (bool, error) {
+	// Skip verification if Stripe key is not set (for development/testing)
+	if stripe.Key == "" {
+		log.Println("Warning: Skipping payment verification because STRIPE_SECRET_KEY is not set")
+		return true, nil
+	}
+
+	// First check if this payment has already been used
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM payment_verifications WHERE payment_intent_id = $1)`,
+		paymentIntentID).Scan(&exists)
+
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("database error checking payment: %v", err)
+	}
+
+	if exists {
+		// Payment found and already used
+		return false, fmt.Errorf("payment has already been used")
+	}
+
+	// If not found in our database, verify with Stripe
+	pi, err := paymentintent.Get(paymentIntentID, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to verify payment with Stripe: %v", err)
+	}
+
+	// Check if payment is successful
+	if pi.Status != stripe.PaymentIntentStatusSucceeded {
+		return false, fmt.Errorf("payment is not successful, status: %s", pi.Status)
+	}
+
+	// Check if amount matches
+	stripeAmount := int(pi.Amount / 100) // Convert from cents
+	if stripeAmount != expectedAmount {
+		return false, fmt.Errorf("payment amount mismatch: expected %d, got %d", expectedAmount, stripeAmount)
+	}
+
+	// Record this payment in our database - just store the payment intent ID and timestamp
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO payment_verifications (payment_intent_id, amount, created_at) 
+		VALUES ($1, $2, NOW())`,
+		paymentIntentID, expectedAmount)
+
+	if err != nil {
+		return false, fmt.Errorf("failed to record payment verification: %v", err)
+	}
+
+	return true, nil
 }
 
 func main() {
