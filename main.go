@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -54,6 +56,7 @@ type Server struct {
 	incrScript  *redis.Script
 	rateLimiter sync.Map // clientID -> lastIncrementTime
 	ipLimiter   sync.Map // IP -> connectionInfo
+	instanceID  string   // Unique ID for this server instance
 }
 
 // ConnectionInfo tracks connection attempts from an IP
@@ -202,6 +205,7 @@ func NewServer() *Server {
 		upgrader:    upgrader,
 		db:          db,
 		incrScript:  incrScript,
+		instanceID:  uuid.New().String(), // Generate unique instance ID
 	}
 }
 
@@ -253,32 +257,26 @@ func (s *Server) getViewerCount() int {
 func (s *Server) updateViewerCount(ctx context.Context) {
 	count := s.getViewerCount()
 
-	// Prepare statement for cleanup
+	// Prepare statement for cleanup - only clean up stale viewers for this instance
 	cleanupStmt, err := s.db.PrepareContext(ctx,
-		`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '30 seconds'`)
+		`DELETE FROM viewers WHERE server_instance_id = $1 AND last_seen < NOW() - INTERVAL '30 seconds'`)
 	if err != nil {
 		errorLog("Error preparing cleanup statement: %v", err)
 		return
 	}
 	defer cleanupStmt.Close()
 
-	result, err := cleanupStmt.ExecContext(ctx)
+	result, err := cleanupStmt.ExecContext(ctx, s.instanceID)
 	if err != nil {
 		errorLog("Error cleaning up stale viewers: %v", err)
 	} else {
 		rowsAffected, _ := result.RowsAffected()
 		if rowsAffected > 0 {
-			log.Printf("Cleaned up %d stale viewer records", rowsAffected)
+			log.Printf("Cleaned up %d stale viewer records for instance %s", rowsAffected, s.instanceID)
 		}
 	}
 
-	// Update Redis with current count
-	err = s.redisClient.Set(ctx, "viewer_count", count, 0).Err()
-	if err != nil {
-		errorLog("Error updating viewer count in Redis: %v", err)
-	} else {
-		log.Printf("Updated viewer count in Redis: %d", count)
-	}
+	log.Printf("Current viewer count across all instances: %d", count)
 }
 
 // isRateLimited checks if a client is rate limited for increment operations
@@ -338,25 +336,30 @@ func (s *Server) trackViewers(ctx context.Context) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				// Update viewer count in Redis
+				// Update viewer count and clean up old records
 				s.updateViewerCount(ctx)
 
-				// Clean up old records from viewers table
-				result, err := s.db.ExecContext(ctx,
-					`DELETE FROM viewers WHERE last_seen < NOW() - INTERVAL '30 seconds'`)
+				// Log current viewer count for this instance
+				var instanceCount int
+				instanceStmt, err := s.db.PrepareContext(ctx,
+					`SELECT COUNT(*) FROM viewers WHERE server_instance_id = $1 AND last_seen > NOW() - INTERVAL '30 seconds'`)
 				if err != nil {
-					errorLog("Error cleaning up old viewer records: %v", err)
+					errorLog("Error preparing instance count statement: %v", err)
 				} else {
-					if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected > 0 {
-						log.Printf("Cleaned up %d stale viewer records", rowsAffected)
+					defer instanceStmt.Close()
+					err = instanceStmt.QueryRowContext(ctx, s.instanceID).Scan(&instanceCount)
+					if err != nil {
+						errorLog("Error getting instance viewer count: %v", err)
+					} else {
+						log.Printf("Current active viewers for instance %s: %d", s.instanceID, instanceCount)
 					}
 				}
 
-				// Log current viewer count
-				var count int
+				// Log total active viewers
+				var totalCount int
 				if err := s.db.QueryRowContext(ctx,
-					`SELECT COUNT(*) FROM viewers`).Scan(&count); err == nil {
-					log.Printf("Current active viewers in database: %d", count)
+					`SELECT COUNT(*) FROM viewers WHERE last_seen > NOW() - INTERVAL '30 seconds'`).Scan(&totalCount); err == nil {
+					log.Printf("Total active viewers across all instances: %d", totalCount)
 				}
 			}
 		}
@@ -402,9 +405,6 @@ func (s *Server) cleanupRateLimiters(ctx context.Context) {
 func (s *Server) handleViewerCount(w http.ResponseWriter, r *http.Request) {
 	count := s.getViewerCount()
 
-	// Update the count in Redis as well
-	s.updateViewerCount(ctx)
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]int{"count": count})
@@ -417,7 +417,7 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]interface{}{
 		"status":      "ok",
-		"instance_id": "N/A", // Since leader election is removed
+		"instance_id": s.instanceID,
 		"is_leader":   false,
 		"timestamp":   time.Now().Format(time.RFC3339),
 		"connections": s.getViewerCount(),
@@ -786,14 +786,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							// Prepare statement for user stats
 							userStatsStmt, err := s.db.PrepareContext(context.Background(), `
-								INSERT INTO user_stats (user_id, username, increment_count, total_value_added, last_increment)
-								VALUES ($1, $2, 1, $3, NOW())
+								INSERT INTO user_stats (user_id, increment_count, total_value_added, last_increment)
+								VALUES ($1, 1, $2, NOW())
 								ON CONFLICT (user_id)
 								DO UPDATE SET
 									increment_count = user_stats.increment_count + 1,
-									total_value_added = user_stats.total_value_added + $3::numeric,
-									last_increment = NOW(),
-									username = $2
+									total_value_added = user_stats.total_value_added + $2::numeric,
+									last_increment = NOW()
 							`)
 							if err != nil {
 								errorLog("Error preparing user stats statement: %v", err)
@@ -801,12 +800,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							}
 							defer userStatsStmt.Close()
 
-							_, err = userStatsStmt.ExecContext(context.Background(), dbUserID, username, valueDiff.String())
+							_, err = userStatsStmt.ExecContext(context.Background(), dbUserID, valueDiff.String())
 
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
 							} else {
-								log.Printf("Successfully updated user stats for %s, added value: %s", username, valueDiff.String())
+								log.Printf("Successfully updated user stats for user %s, added value: %s", dbUserID.String(), valueDiff.String())
 							}
 
 							// Insert user activity
@@ -995,10 +994,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) trackViewer(ctx context.Context, clientID, ipAddress, userAgent string) {
 	// Prepare statement for tracking viewer
 	stmt, err := s.db.PrepareContext(ctx, `
-		INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
-		VALUES ($1, NOW(), $2, $3)
+		INSERT INTO viewers (client_id, last_seen, ip_address, user_agent, server_instance_id)
+		VALUES ($1, NOW(), $2, $3, $4)
 		ON CONFLICT (client_id) 
-		DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
+		DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3, server_instance_id = $4
 	`)
 	if err != nil {
 		errorLog("Error preparing viewer tracking statement: %v", err)
@@ -1010,7 +1009,8 @@ func (s *Server) trackViewer(ctx context.Context, clientID, ipAddress, userAgent
 	_, err = stmt.ExecContext(ctx,
 		clientID,
 		ipAddress,
-		userAgent)
+		userAgent,
+		s.instanceID)
 
 	if err != nil {
 		errorLog("Error tracking viewer in database: %v", err)
@@ -1080,6 +1080,9 @@ func (s *Server) cleanupStaleViewers() {
 
 	rowsAffected, _ := result.RowsAffected()
 	log.Printf("Startup cleanup: Removed %d stale viewer records", rowsAffected)
+
+	// Log the instance ID
+	log.Printf("Server instance ID: %s", s.instanceID)
 }
 
 // Record counter history
@@ -1112,6 +1115,35 @@ func main() {
 	// These services run on all instances
 	go server.trackViewers(ctx)
 	go server.cleanupRateLimiters(ctx)
+
+	// Set up signal handling for graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-stop
+		log.Println("Shutting down server...")
+
+		// Clean up all viewers for this server instance
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Prepare statement for cleanup - only remove viewers for this instance
+		stmt, err := server.db.PrepareContext(cleanupCtx, `DELETE FROM viewers WHERE server_instance_id = $1`)
+		if err != nil {
+			errorLog("Error preparing shutdown cleanup statement: %v", err)
+		} else {
+			defer stmt.Close()
+			result, err := stmt.ExecContext(cleanupCtx, server.instanceID)
+			if err != nil {
+				errorLog("Error cleaning up viewers on shutdown: %v", err)
+			} else if rowsAffected, err := result.RowsAffected(); err == nil {
+				log.Printf("Shutdown cleanup: Removed %d viewer records for instance %s", rowsAffected, server.instanceID)
+			}
+		}
+
+		os.Exit(0)
+	}()
 
 	http.HandleFunc("/ws", server.handleWebSocket)
 	http.HandleFunc("/viewer-count", server.handleViewerCount)
