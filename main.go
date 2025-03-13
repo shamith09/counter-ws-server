@@ -652,6 +652,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						// Calculate the difference
 						valueDiff = new(big.Int).Sub(result, currentBig)
 
+						// Log the multiplication details
+						log.Printf("Multiplication: %s × %d = %s (adding %s to user stats)",
+							currentBig.String(), multiplyAmount, result.String(), valueDiff.String())
+
 						// Store the result
 						newCount = result.String()
 						if err := s.redisClient.Set(ctx, "counter", newCount, 0).Err(); err != nil {
@@ -675,22 +679,38 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					// Update stats in background
 					if msg.UserID != "" {
 						go func(userID string, valueDiff *big.Int, countryCode, countryName string, operation string) {
+							// Log the incoming user ID for debugging
+							log.Printf("Processing increment attribution for userID: %s", userID)
+
 							// First get the actual UUID from users table
 							var dbUserID uuid.UUID
-							var err error
+							var lookupErr error
 
 							if _, err := uuid.Parse(userID); err == nil {
-								_ = s.db.QueryRowContext(context.Background(),
+								// It's a valid UUID format, try direct lookup
+								lookupErr = s.db.QueryRowContext(context.Background(),
 									"SELECT id FROM users WHERE id = $1", userID).Scan(&dbUserID)
+								if lookupErr != nil {
+									errorLog("Error finding user by ID: %v, userID: %s", lookupErr, userID)
+								}
 							} else {
-								_ = s.db.QueryRowContext(context.Background(),
+								// Try lookup by oauth_id
+								lookupErr = s.db.QueryRowContext(context.Background(),
 									"SELECT id FROM users WHERE oauth_id = $1", userID).Scan(&dbUserID)
+
+								// If that fails, try by email as fallback
+								if lookupErr != nil {
+									lookupErr = s.db.QueryRowContext(context.Background(),
+										"SELECT id FROM users WHERE email = $1", userID).Scan(&dbUserID)
+								}
 							}
 
-							if err != nil {
-								errorLog("Error finding user: %v", err)
+							if lookupErr != nil {
+								errorLog("Failed to find user in database: %v, userID: %s", lookupErr, userID)
 								return
 							}
+
+							log.Printf("Successfully found user with DB ID: %s for userID: %s", dbUserID.String(), userID)
 
 							// Update user_stats table with the actual UUID
 							_, err = s.db.ExecContext(context.Background(), `
@@ -705,6 +725,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 							if err != nil {
 								errorLog("Error updating user stats: %v", err)
+							} else {
+								// Log operation type and value added
+								if operation == "multiply" {
+									log.Printf("Successfully attributed multiplication to user %s, added value: %s",
+										dbUserID.String(), valueDiff.String())
+								} else {
+									log.Printf("Successfully attributed increment to user %s, added value: %s",
+										dbUserID.String(), valueDiff.String())
+								}
 							}
 
 							// Insert user activity
@@ -740,6 +769,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 								if err != nil {
 									errorLog("Error inserting country activity: %v", err)
+								} else {
+									log.Printf("Successfully updated country stats for %s, added value: %s", countryName, valueDiff.String())
 								}
 							}
 						}(msg.UserID, valueDiff, msg.CountryCode, msg.CountryName, msg.Operation)
