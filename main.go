@@ -471,8 +471,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			INSERT INTO viewers (client_id, last_seen, ip_address, user_agent)
 			VALUES ($1, NOW(), $2, $3)
 			ON CONFLICT (client_id) 
-			DO UPDATE SET last_seen = NOW(), ip_address = $4, user_agent = $5
-		`, clientID, ipAddress, r.UserAgent(), ipAddress, r.UserAgent())
+			DO UPDATE SET last_seen = NOW(), ip_address = $2, user_agent = $3
+		`, clientID, ipAddress, r.UserAgent())
 
 		if err != nil {
 			errorLog("Error tracking viewer in database: %v", err)
