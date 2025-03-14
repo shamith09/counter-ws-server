@@ -756,7 +756,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						}
 
 						// Verify the payment with Stripe
-						valid, err := s.verifyPayment(ctx, msg.PaymentIntentID, msg.MultiplyAmount)
+						valid, err := s.verifyPayment(ctx, msg.PaymentIntentID, msg.MultiplyAmount, msg.UserID)
 						if !valid || err != nil {
 							errorLog("Payment verification failed: %v", err)
 							if err := conn.WriteJSON(Message{
@@ -857,6 +857,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 									defer emailStmt.Close()
 
 									err = emailStmt.QueryRowContext(context.Background(), userID).Scan(&dbUserID, &email, &username)
+									if err != nil {
+										errorLog("Error looking up user by email: %v, email: %s", err, userID)
+									}
 								}
 							}
 
@@ -1172,7 +1175,7 @@ func (s *Server) cleanupStaleViewers() {
 }
 
 // verifyPayment checks if a payment is valid and hasn't been used before
-func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expectedAmount int) (bool, error) {
+func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expectedAmount int, userID string) (bool, error) {
 	// Skip verification if Stripe key is not set (for development/testing)
 	if stripe.Key == "" {
 		log.Println("Warning: Skipping payment verification because STRIPE_SECRET_KEY is not set")
@@ -1194,6 +1197,43 @@ func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expe
 		return false, fmt.Errorf("payment has already been used")
 	}
 
+	// Check if user has already multiplied in the last 24 hours
+	if userID != "" {
+		var userUUID uuid.UUID
+		var err error
+
+		// Try to parse the userID as UUID
+		userUUID, err = uuid.Parse(userID)
+		if err != nil {
+			// If not a UUID, try to look up the user by other means (oauth_id, email)
+			err = s.db.QueryRowContext(ctx,
+				`SELECT id FROM users WHERE oauth_id = $1 OR email = $1`,
+				userID).Scan(&userUUID)
+
+			if err != nil {
+				errorLog("Failed to find user in database: %v, userID: %s", err, userID)
+				// Continue with payment verification but won't be able to enforce daily limit
+			}
+		}
+
+		if err == nil {
+			// Check if user has already multiplied in the last 24 hours
+			var hasMultipliedToday bool
+			err = s.db.QueryRowContext(ctx,
+				`SELECT EXISTS(
+					SELECT 1 FROM payment_verifications 
+					WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+				)`,
+				userUUID).Scan(&hasMultipliedToday)
+
+			if err != nil && err != sql.ErrNoRows {
+				errorLog("Error checking for previous multiplications: %v", err)
+			} else if hasMultipliedToday {
+				return false, fmt.Errorf("you can only multiply once per day, please try again tomorrow")
+			}
+		}
+	}
+
 	// If not found in our database, verify with Stripe
 	pi, err := paymentintent.Get(paymentIntentID, nil)
 	if err != nil {
@@ -1211,11 +1251,39 @@ func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expe
 		return false, fmt.Errorf("payment amount mismatch: expected %d, got %d", expectedAmount, stripeAmount)
 	}
 
-	// Record this payment in our database - just store the payment intent ID and timestamp
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO payment_verifications (payment_intent_id, amount, created_at) 
-		VALUES ($1, $2, NOW())`,
-		paymentIntentID, expectedAmount)
+	// Parse user UUID if provided
+	var userUUID *uuid.UUID
+	if userID != "" {
+		parsed, err := uuid.Parse(userID)
+		if err == nil {
+			userUUID = &parsed
+		} else {
+			// Try to look up the user by oauth_id or email
+			var dbUserID uuid.UUID
+			err = s.db.QueryRowContext(ctx,
+				`SELECT id FROM users WHERE oauth_id = $1 OR email = $1`,
+				userID).Scan(&dbUserID)
+
+			if err == nil {
+				userUUID = &dbUserID
+			} else {
+				errorLog("Failed to find user for recording payment: %v, userID: %s", err, userID)
+			}
+		}
+	}
+
+	// Record this payment in our database with user_id if available
+	if userUUID != nil {
+		_, err = s.db.ExecContext(ctx,
+			`INSERT INTO payment_verifications (payment_intent_id, amount, user_id, created_at) 
+			VALUES ($1, $2, $3, NOW())`,
+			paymentIntentID, expectedAmount, userUUID)
+	} else {
+		_, err = s.db.ExecContext(ctx,
+			`INSERT INTO payment_verifications (payment_intent_id, amount, created_at) 
+			VALUES ($1, $2, NOW())`,
+			paymentIntentID, expectedAmount)
+	}
 
 	if err != nil {
 		return false, fmt.Errorf("failed to record payment verification: %v", err)
