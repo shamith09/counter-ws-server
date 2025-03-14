@@ -17,3 +17,9 @@ vendor/
 
 # Environment variables
 .env.development
+.env.production
+
+# server stuff
+server
+deploy.sh
+
