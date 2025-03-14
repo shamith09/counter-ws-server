@@ -356,8 +356,8 @@ func (s *Server) isRateLimited(clientID string) bool {
 // isIPRateLimited checks if an IP is making too many connection attempts
 // Returns true if the IP should be blocked
 func (s *Server) isIPRateLimited(ipAddress string) bool {
-	// Rate limit: 10 connections per minute per IP
-	const maxConnections = 10
+	// Rate limit: 20 connections per minute per IP
+	const maxConnections = 20
 	const resetPeriod = 1 * time.Minute
 
 	now := time.Now()
