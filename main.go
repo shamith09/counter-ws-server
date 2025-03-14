@@ -105,6 +105,7 @@ type Server struct {
 	incrScript  *redis.Script
 	rateLimiter sync.Map // clientID -> lastIncrementTime
 	ipLimiter   sync.Map // IP -> connectionInfo
+	userLimiter sync.Map // userID -> lastIncrementTime
 	instanceID  string   // Unique ID for this server instance
 }
 
@@ -382,6 +383,29 @@ func (s *Server) isIPRateLimited(ipAddress string) bool {
 	return info.count > maxConnections
 }
 
+// isUserRateLimited checks if a user is rate limited for increment operations
+// Returns true if the user is rate limited and should be blocked
+func (s *Server) isUserRateLimited(userID string) bool {
+	if userID == "" {
+		return false // Skip rate limiting for anonymous users
+	}
+
+	// Rate limit: 1 increment per 50ms per user (20 per second)
+	rateLimit := 50 * time.Millisecond
+
+	// Check if user has a recent increment
+	if lastTime, exists := s.userLimiter.Load(userID); exists {
+		// If the last increment was less than rateLimit ago, block the request
+		if time.Since(lastTime.(time.Time)) < rateLimit {
+			return true
+		}
+	}
+
+	// Update the last increment time
+	s.userLimiter.Store(userID, time.Now())
+	return false
+}
+
 func (s *Server) trackViewers(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	go func() {
@@ -452,6 +476,16 @@ func (s *Server) cleanupRateLimiters(ctx context.Context) {
 					// Remove entries older than 10 minutes
 					if now.Sub(info.lastAttempt) > 10*time.Minute {
 						s.ipLimiter.Delete(key)
+					}
+					return true
+				})
+
+				// Clean up user rate limiter
+				s.userLimiter.Range(func(key, value interface{}) bool {
+					lastTime := value.(time.Time)
+					// Remove entries older than 5 minutes
+					if now.Sub(lastTime) > 5*time.Minute {
+						s.userLimiter.Delete(key)
 					}
 					return true
 				})
@@ -719,6 +753,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 
+					// Check user rate limiting if user ID is provided
+					if msg.UserID != "" && s.isUserRateLimited(msg.UserID) {
+						if err := conn.WriteJSON(Message{
+							Type:  "rate_limited",
+							Count: "Too many requests from your account. Please wait a moment.",
+						}); err != nil {
+							errorLog("Error sending user rate limit message: %v", err)
+						}
+						continue
+					}
+
 					// Get current count before any operation
 					currentCount, err := s.redisClient.Get(ctx, "counter").Result()
 					if err != nil {
@@ -839,6 +884,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 									defer directStmt.Close()
 
 									err = directStmt.QueryRowContext(context.Background(), parsedUUID).Scan(&dbUserID, &email, &username)
+									if err != nil {
+										errorLog("Error looking up user by UUID: %v, UUID: %s", err, userID)
+									}
 								}
 							}
 
