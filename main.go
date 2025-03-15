@@ -1260,26 +1260,31 @@ func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expe
 
 			if err != nil {
 				errorLog("Failed to find user in database: %v, userID: %s", err, userID)
-				// Continue with payment verification but won't be able to enforce daily limit
+				// Don't continue with payment verification if we can't identify the user
+				// This ensures we don't bypass the daily limit check
+				return false, fmt.Errorf("failed to identify user for daily limit check, please contact support")
 			}
 		}
 
-		if err == nil {
-			// Check if user has already multiplied in the last 24 hours
-			var hasMultipliedToday bool
-			err = s.db.QueryRowContext(ctx,
-				`SELECT EXISTS(
-					SELECT 1 FROM payment_verifications 
-					WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
-				)`,
-				userUUID).Scan(&hasMultipliedToday)
+		// Check if user has already multiplied in the last 24 hours
+		var hasMultipliedToday bool
+		err = s.db.QueryRowContext(ctx,
+			`SELECT EXISTS(
+				SELECT 1 FROM payment_verifications 
+				WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+			)`,
+			userUUID).Scan(&hasMultipliedToday)
 
-			if err != nil && err != sql.ErrNoRows {
-				errorLog("Error checking for previous multiplications: %v", err)
-			} else if hasMultipliedToday {
-				return false, fmt.Errorf("you can only multiply once per day, please try again tomorrow")
-			}
+		if err != nil && err != sql.ErrNoRows {
+			errorLog("Error checking for previous multiplications: %v", err)
+			// Don't continue if we can't check the daily limit
+			return false, fmt.Errorf("failed to check daily multiplication limit, please try again later")
+		} else if hasMultipliedToday {
+			return false, fmt.Errorf("you can only multiply once per day, please try again tomorrow")
 		}
+	} else {
+		// Don't allow anonymous multiplications
+		return false, fmt.Errorf("user identification required for multiplication")
 	}
 
 	// If not found in our database, verify with Stripe
@@ -1315,23 +1320,24 @@ func (s *Server) verifyPayment(ctx context.Context, paymentIntentID string, expe
 			if err == nil {
 				userUUID = &dbUserID
 			} else {
+				// We should never reach here because we already checked for user existence above
+				// But just in case, log the error and return an error
 				errorLog("Failed to find user for recording payment: %v, userID: %s", err, userID)
+				return false, fmt.Errorf("failed to identify user for payment recording, please contact support")
 			}
 		}
 	}
 
-	// Record this payment in our database with user_id if available
-	if userUUID != nil {
-		_, err = s.db.ExecContext(ctx,
-			`INSERT INTO payment_verifications (payment_intent_id, amount, user_id, created_at) 
-			VALUES ($1, $2, $3, NOW())`,
-			paymentIntentID, expectedAmount, userUUID)
-	} else {
-		_, err = s.db.ExecContext(ctx,
-			`INSERT INTO payment_verifications (payment_intent_id, amount, created_at) 
-			VALUES ($1, $2, NOW())`,
-			paymentIntentID, expectedAmount)
+	// At this point, userUUID should always be non-nil because we require user identification
+	if userUUID == nil {
+		return false, fmt.Errorf("user identification required for multiplication")
 	}
+
+	// Record this payment in our database with user_id
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO payment_verifications (payment_intent_id, amount, user_id, created_at) 
+		VALUES ($1, $2, $3, NOW())`,
+		paymentIntentID, expectedAmount, userUUID)
 
 	if err != nil {
 		return false, fmt.Errorf("failed to record payment verification: %v", err)
