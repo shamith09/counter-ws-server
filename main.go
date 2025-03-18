@@ -1041,7 +1041,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						s.updateViewerTimestamp(context.Background(), clientID)
 					}()
 
-					// No response needed for ping
+					// Send pong response with server timestamp
+					conn.SetWriteDeadline(time.Now().Add(writeWait))
+					if err := conn.WriteJSON(Message{
+						Type: "pong",
+					}); err != nil {
+						errorLog("Error sending pong: %v", err)
+					}
 				case "pong":
 					conn.SetWriteDeadline(time.Now().Add(writeWait))
 					if err := conn.WriteJSON(Message{Type: "pong"}); err != nil {
